@@ -955,6 +955,16 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 assert state_indices_tensor_p is not None
                 ssm_state[state_indices_tensor_p] = varlen_states
 
+                # LINQ-STATE: prefill->decode handoff — pack the fresh final states into
+                # the packed-int pools; decode below reads/writes only those.
+                from vllm.model_executor.layers.mamba.linq_state_int import (
+                    linq_bits,
+                    linq_pack_slots,
+                )
+
+                if linq_bits():
+                    linq_pack_slots(self, ssm_state, state_indices_tensor_p, varlen_states)
+
         # Process decode requests
         if has_decode:
             assert state_indices_tensor_d is not None
@@ -1027,23 +1037,48 @@ class MambaMixer2(MambaBase, PluggableLayer):
             # - mamba_cache_params.ssm_state's slots will be selected
             #   using state_indices_tensor_d
             # NOTE: final output is an in-place update of out tensor
-            selective_state_update(
-                ssm_state,
-                hidden_states_d,
-                dt_d,
-                A_d,
-                B_d,
-                C_d,
-                D_d,
-                dt_bias,
-                dt_softplus=True,
-                state_batch_indices=state_indices_tensor_d_input,
-                dst_state_batch_indices=state_indices_tensor_d_output,
-                out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
-                num_accepted_tokens=num_accepted_tokens,
-                cu_seqlens=query_start_loc_d,
-                is_blackwell=self.is_blackwell,
+
+            # LINQ-STATE: decode on the packed-int state pools instead of ssm_state.
+            from vllm.model_executor.layers.mamba.linq_state_int import (
+                linq_bits,
+                linq_decode,
             )
+
+            if linq_bits():
+                linq_decode(
+                    self,
+                    ssm_state,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    C_d,
+                    D_d,
+                    dt_bias,
+                    state_indices_tensor_d_input,
+                    state_indices_tensor_d_output,
+                    preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
+                    num_accepted_tokens,
+                    query_start_loc_d,
+                )
+            else:
+                selective_state_update(
+                    ssm_state,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    C_d,
+                    D_d,
+                    dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_tensor_d_input,
+                    dst_state_batch_indices=state_indices_tensor_d_output,
+                    out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
+                    num_accepted_tokens=num_accepted_tokens,
+                    cu_seqlens=query_start_loc_d,
+                    is_blackwell=self.is_blackwell,
+                )
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None
