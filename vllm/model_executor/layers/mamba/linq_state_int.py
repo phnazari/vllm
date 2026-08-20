@@ -23,17 +23,18 @@ def linq_bits() -> int:
     return _BITS
 
 
-def _pools(mixer, ssm_state):
-    """Lazily allocate codes/scales pools sized to the slot pool (outside graph capture)."""
-    if getattr(mixer, "_linq_codes", None) is None:
-        from linquant.real_state import pack_state
+def _pools(mixer):
+    """Codes/scales pools from the layer's accounted cache state (see get_state_shape).
 
-        slots, nheads, dim, dstate = ssm_state.shape
-        assert dstate == 128, f"int state kernel requires dstate == 128, got {dstate}"
-        p = pack_state(torch.zeros(1, nheads, dim, dstate, device=ssm_state.device), _BITS, 128)
-        mixer._linq_codes = torch.zeros(slots, *p.codes.shape[1:], dtype=torch.uint8, device=ssm_state.device)
-        mixer._linq_scales = torch.full((slots, *p.scales.shape[1:]), 1e-12, dtype=torch.float32, device=ssm_state.device)
-    return mixer._linq_codes, mixer._linq_scales
+    Returns None during vLLM's memory-profiling phase, when the layer still holds the
+    dummy placeholder cache — callers must no-op then. Side allocations are wrong here:
+    vLLM sizes the slot pool to fill the GPU, so anything unaccounted either overflows
+    (index-OOB) or OOMs (both observed at the b=128 bench).
+    """
+    kv = mixer.kv_cache
+    if len(kv) < 4 or kv[2].numel() == 0:
+        return None
+    return kv[2], kv[3]
 
 
 @torch.no_grad()
@@ -41,10 +42,14 @@ def linq_pack_slots(mixer, ssm_state, state_indices, states):
     """Pack ``states`` (fp [n, H, D, N]) into the slots ``state_indices`` (prefill handoff)."""
     from linquant.real_state import pack_state
 
-    codes, scales = _pools(mixer, ssm_state)
+    pools = _pools(mixer)
+    if pools is None:  # profiling-phase dummy cache
+        return
+    codes, scales = pools
     p = pack_state(states.to(torch.float32), _BITS, 128)
     codes[state_indices] = p.codes
-    scales[state_indices] = p.scales
+    assert p.scales.shape[-1] == 1, p.scales.shape  # one 128-block per row
+    scales[state_indices] = p.scales.squeeze(-1)
 
 
 @torch.no_grad()
@@ -64,7 +69,9 @@ def linq_decode(mixer, ssm_state, x, dt, A, B, C, D, dt_bias, state_indices_in,
             f"LINQ int state: expected one state block per seq, got {tuple(state_indices_in.shape)}"
         )
         state_indices_in = state_indices_in.squeeze(1)
-    codes, scales = _pools(mixer, ssm_state)
+    pools = _pools(mixer)
+    assert pools is not None, "LINQ int state: decode before cache pools are bound"
+    codes, scales = pools
     selective_state_update_int(
         codes,
         scales,

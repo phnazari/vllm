@@ -591,7 +591,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Triton's autotuner includes tensor dtypes in its cache key,
         # so state_dtype must match what real inference uses.
-        _, ssm_state_dtype = self.get_state_dtype()
+        ssm_state_dtype = self.get_state_dtype()[1]  # LINQ-STATE: tuple may carry extra entries
 
         # SSD kernel autotune keys depend on dtype and head dimensions,
         # not on sequence length or batch size, so a single shape suffices.
@@ -1080,16 +1080,17 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     is_blackwell=self.is_blackwell,
                 )
 
-    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None
         assert self.cache_config is not None
+        # LINQ-STATE: the calculator appends the codes/scales entries when enabled.
         return MambaStateDtypeCalculator.mamba2_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
         )
 
-    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
         return MambaStateShapeCalculator.mamba2_state_shape(
             intermediate_size=self.intermediate_size,
             tp_world_size=get_tensor_model_parallel_world_size(),

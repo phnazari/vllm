@@ -76,9 +76,15 @@ class MambaStateDtypeCalculator:
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType,
     ) -> tuple[torch.dtype, ...]:
-        return cls._mamba_state_dtype(
+        dtypes = cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
+        # LINQ-STATE: packed codes (uint8) + per-row scales (fp32) as accounted state.
+        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+
+        if linq_bits():
+            dtypes = (*dtypes, torch.uint8, torch.float32)
+        return dtypes
 
     @classmethod
     def _mamba_state_dtype(
@@ -184,6 +190,19 @@ class MambaStateShapeCalculator:
         # - they are typically small
         #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+
+        # LINQ-STATE: codes [H, D, state*bits/8] + scales [H, D] (per-row, state_size == 128).
+        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+
+        bits = linq_bits()
+        if bits:
+            code_w = {4: state_size // 2, 6: 3 * state_size // 4, 8: state_size}[bits]
+            return (
+                conv_state_shape,
+                temporal_state_shape,
+                (divide(num_heads, tp_world_size), head_dim, code_w),
+                (divide(num_heads, tp_world_size), head_dim),
+            )
         return conv_state_shape, temporal_state_shape
 
     @classmethod
