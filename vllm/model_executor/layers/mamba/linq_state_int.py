@@ -59,6 +59,11 @@ def linq_decode(mixer, ssm_state, x, dt, A, B, C, D, dt_bias, state_indices_in,
     assert state_indices_out is None or state_indices_out is state_indices_in, (
         "LINQ int state: mamba_cache_mode must be 'none' (dst slots != src slots)"
     )
+    if state_indices_in.dim() == 2:  # block-table form [batch, num_blocks]
+        assert state_indices_in.shape[1] == 1, (
+            f"LINQ int state: expected one state block per seq, got {tuple(state_indices_in.shape)}"
+        )
+        state_indices_in = state_indices_in.squeeze(1)
     codes, scales = _pools(mixer, ssm_state)
     selective_state_update_int(
         codes,
