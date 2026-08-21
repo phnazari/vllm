@@ -86,4 +86,5 @@ def linq_decode(mixer, ssm_state, x, dt, A, B, C, D, dt_bias, state_indices_in,
         state_batch_indices=state_indices_in,
         bits=_BITS,
         out=out,
+        null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
     )
