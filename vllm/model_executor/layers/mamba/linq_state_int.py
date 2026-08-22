@@ -207,3 +207,28 @@ def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices
         out=out,
     )
     return o
+
+
+# --- parity probe -------------------------------------------------------------------------
+# Does the vLLM decode path inject the same quantization error as the HF fake-quant harness
+# that produced the accuracy campaign? The two stacks cannot agree bitwise (different chunk
+# scan, different attention backend), so the comparison is made on the fp state handed from
+# prefill to decode -- the exact tensor both quantizers consume. Dumped only when
+# LINQ_DUMP_STATE names a directory, and only for the FIRST prefill of each layer (later
+# prefills in a served run would overwrite with a different sequence's state).
+_DUMPED: set[str] = set()
+
+
+@torch.no_grad()
+def linq_dump_handoff_state(mixer, varlen_states) -> None:
+    """Persist ``varlen_states`` (fp [n, H, D, N]) for ``mixer`` to $LINQ_DUMP_STATE."""
+    d = os.environ.get("LINQ_DUMP_STATE")
+    if not d:
+        return
+    key = getattr(mixer, "prefix", "") or f"layer{len(_DUMPED)}"
+    if key in _DUMPED:
+        return
+    _DUMPED.add(key)
+    os.makedirs(d, exist_ok=True)
+    torch.save(varlen_states.detach().float().cpu(),
+               os.path.join(d, key.replace("/", "_") + ".pt"))

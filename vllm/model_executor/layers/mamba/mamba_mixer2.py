@@ -26,6 +26,22 @@ from vllm.model_executor.layers.mamba.linq_state_int import (  # LINQ-STATE
     linq_bits,
     linq_unpack_slots,
 )
+from vllm.model_executor.layers.mamba.ops.unrotate_norm_gated import (  # LINQ-ROT
+    unrotate_rmsnorm_gated,
+)
+from vllm.model_executor.layers.mamba.linq_rotate import (  # LINQ-ROT
+    linq_norm_fused,
+    linq_norm_matrix,
+    linq_rot_any,
+    linq_unrotate_x,
+    mamba2_spec,
+)
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_butterfly import (  # LINQ-ROT
+    causal_conv1d_fn as causal_conv1d_fn_rot,
+)
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_butterfly import (  # LINQ-ROT
+    causal_conv1d_update as causal_conv1d_update_rot,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
@@ -76,11 +92,18 @@ class Mixer2RMSNormGated(CustomOp):
         full_n_groups: int,
         use_rms_norm: bool = True,
         eps: float = 1e-6,
+        head_dim: int | None = None,  # LINQ-ROT: needed to undo R_v
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.full_hidden_size = full_hidden_size
+        rmat = linq_norm_matrix(head_dim)  # LINQ-ROT
+        self._linq_unrot = rmat is not None
+        self._linq_head_dim = head_dim or 1
+        if rmat is not None:  # buffers, so the module move puts them on the GPU at load
+            self.register_buffer("_linq_rmat", rmat, persistent=False)
+            self.register_buffer("_linq_signs", rmat[:, 0].sign(), persistent=False)
         self.group_size = full_hidden_size // full_n_groups
         self.per_rank_hidden_size = full_hidden_size // self.tp_size
         self.n_groups = full_hidden_size // self.group_size
@@ -113,6 +136,18 @@ class Mixer2RMSNormGated(CustomOp):
         #   3. The general case can be pretty complicated so we AllGather
         #      the input and then redundantly compute the RMSNorm.
         input_dtype = x.dtype
+        if linq_norm_fused() and self.use_rms_norm and self.tp_size == 1:
+            return unrotate_rmsnorm_gated(  # LINQ-ROT: same kernel with and without R_v
+                x,
+                gate,
+                self.weight,
+                self._linq_signs if self._linq_unrot else None,
+                self._linq_head_dim,
+                self.group_size,
+                self.variance_epsilon,
+            )
+        if self._linq_unrot:  # LINQ-ROT: undo R_v before gate and RMS
+            x = linq_unrotate_x(x, self._linq_rmat)
         x = x * nn.functional.silu(gate.to(torch.float32))
         if not self.use_rms_norm:
             return x.to(input_dtype)
@@ -155,12 +190,13 @@ class Mixer2RMSNormGated(CustomOp):
         gate: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         input_dtype = x.dtype
+        if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
+            return self.forward_native(x, gate)  # unrotates there; do NOT do it twice
+        if self._linq_unrot:  # LINQ-ROT: undo R_v before gate and RMS
+            x = linq_unrotate_x(x, self._linq_rmat)
         if not self.use_rms_norm:
             # Keep gate in float32 for numerical stability during silu
             return x * nn.functional.silu(gate.to(torch.float32)).to(input_dtype)
-
-        if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
-            return self.forward_native(x, gate)
 
         return rms_norm_gated(
             x,
@@ -477,7 +513,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
 
         self.norm = Mixer2RMSNormGated(
-            intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
+            intermediate_size,
+            n_groups,
+            self.use_rms_norm,
+            eps=rms_norm_eps,
+            head_dim=head_dim,  # LINQ-ROT
         )
 
         self._ssd_kernels_warmed_up = False
@@ -827,7 +867,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
-            hidden_states_B_C_p = causal_conv1d_fn(
+            conv_fn = causal_conv1d_fn
+            rot_kw = {}
+            if linq_rot_any():  # LINQ-ROT: rotate on the way out of the conv
+                sg, l2d, rd = mamba2_spec(self)
+                conv_fn = causal_conv1d_fn_rot
+                rot_kw = {"rot_signs": sg, "rot_log2dim": l2d, "rot_d": rd}
+            hidden_states_B_C_p = conv_fn(
                 x,
                 self.conv_weights,
                 self.conv1d.bias,
@@ -842,6 +888,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 block_size_to_align=mamba_block_size,
                 metadata=attn_metadata,
                 query_start_loc=query_start_loc_p,
+                **rot_kw,
             ).transpose(0, 1)[:num_prefill_tokens]
 
             hidden_states_p, B_p, C_p = self.split_hidden_states_B_C_fn(
@@ -985,7 +1032,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
                 # LINQ-STATE: prefill->decode handoff — pack the fresh final states into
                 # the packed-int pools; decode below reads/writes only those.
-                from vllm.model_executor.layers.mamba.linq_state_int import linq_pack_slots
+                from vllm.model_executor.layers.mamba.linq_state_int import (
+                    linq_dump_handoff_state,
+                    linq_pack_slots,
+                )
+
+                # the fp state the quantizer is about to see -- the HF fake-quant path's
+                # comparison point (LINQ_DUMP_STATE=<dir>); no-op when unset
+                linq_dump_handoff_state(self, varlen_states)
 
                 if linq_bits():
                     linq_pack_slots(self, state_indices_tensor_p, varlen_states)
@@ -1023,7 +1077,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 state_indices_tensor_d_output = state_indices_tensor_d
 
             # 2. Convolution sequence transformation
-            hidden_states_B_C_d = causal_conv1d_update(
+            conv_upd = causal_conv1d_update
+            rot_kw_d = {}
+            if linq_rot_any():  # LINQ-ROT: same rotation as prefill, one basis for the state
+                sg, l2d, rd = mamba2_spec(self)
+                conv_upd = causal_conv1d_update_rot
+                rot_kw_d = {"rot_signs": sg, "rot_log2dim": l2d, "rot_d": rd}
+            hidden_states_B_C_d = conv_upd(
                 hidden_states_B_C_d,
                 conv_state,
                 self.conv_weights,
@@ -1035,6 +1095,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
                 max_query_len=state_indices_tensor_d.size(-1),
+                **rot_kw_d,
             )
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
