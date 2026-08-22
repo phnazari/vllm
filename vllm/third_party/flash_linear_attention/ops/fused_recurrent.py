@@ -8,6 +8,9 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+from contextlib import contextmanager
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -336,6 +339,35 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
+# LINQ-STATE: (BV, warps, stages) per batch, swept with the same cold-L2 recipe as our int
+# kernels (scripts/investigate/vllm_qwen_launch_tune.py, Qwen3.5-9B, H100, 2026-08-21).
+def _linq_load_fp_cfg():
+    """(BV, warps, stages) per batch for the fp baseline, from the tuner's JSON."""
+    path = os.environ.get("LINQ_GDN_TUNED_JSON")
+    if os.environ.get("LINQ_GDN_TUNED_FP") != "1" or not path or not os.path.exists(path):
+        return {}
+    import json
+
+    return {int(b): tuple(c) for b, c in json.load(open(path)).get("fp", {}).items()}
+
+
+_LINQ_TUNED_FP = _linq_load_fp_cfg()
+
+_linq_gdn_cfg: tuple[int, int, int] | None = None
+
+
+@contextmanager
+def override_gdn_decode_config(config: tuple[int, int, int] | None):
+    """LINQ-STATE: pin (BV, num_warps, num_stages) for the packed decode kernel."""
+    global _linq_gdn_cfg
+    prev = _linq_gdn_cfg
+    _linq_gdn_cfg = config
+    try:
+        yield
+    finally:
+        _linq_gdn_cfg = prev
+
+
 def fused_recurrent_gated_delta_rule_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -437,6 +469,14 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     BV = min(triton.next_power_of_2(V), 32)
     num_stages = 3
     num_warps = 1
+    # LINQ-STATE: tuning override, else the per-batch table swept with our recipe.
+    if _linq_gdn_cfg is not None:
+        BV, num_warps, num_stages = _linq_gdn_cfg
+    elif _LINQ_TUNED_FP:
+        for _b in (128, 64, 32, 16, 8, 4, 2, 1):
+            if _b <= B and _b in _LINQ_TUNED_FP:
+                BV, num_warps, num_stages = _LINQ_TUNED_FP[_b]
+                break
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)

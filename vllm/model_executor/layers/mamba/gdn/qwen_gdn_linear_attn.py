@@ -27,6 +27,12 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.linq_state_int import (
+    linq_bits,
+    linq_gdn_decode,
+    linq_pack_slots_gdn,
+    linq_unpack_slots,
+)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
@@ -482,6 +488,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
 
+        if linq_bits():
+            # LINQ-STATE scope: decode writes the int pool only, so a cache mode that copies
+            # state between slots (prefix caching) would resurrect stale fp state.
+            assert (
+                get_current_vllm_config().cache_config.mamba_cache_mode == "none"
+            ), "LINQ int state: mamba_cache_mode must be 'none'"
+
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -728,6 +741,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         return mixed_qkv_out, z_out, b_out, a_out
+
+    def _linq_scratch(self, n, device):
+        """Prefill-only fp state buffer, sized to the batch -- never part of the page."""
+        hv = self.num_v_heads // self.tp_size
+        buf = getattr(self, "_linq_scratch_buf", None)
+        if buf is None or buf.shape[0] < n:
+            buf = torch.empty((n, hv, self.head_v_dim, self.head_k_dim),
+                              dtype=torch.float32, device=device)
+            self._linq_scratch_buf = buf
+        return buf[:n]
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
@@ -1018,7 +1041,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         dtype = qkv_or_qkvz.dtype
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
+        state_dtype = self.get_state_dtype()[1]  # LINQ-STATE appends code/scale dtypes
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -1203,6 +1226,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
+        # LINQ-STATE scope: the int pool is written by the decode kernel only, so the
+        # multi-query (spec decode) path would silently diverge from it.
+        assert not (linq_bits() and attn_metadata.spec_sequence_masks is not None), (
+            "LINQ int state: spec decode unsupported"
+        )
+
         if (
             self.enable_packed_recurrent_decode
             and attn_metadata.spec_sequence_masks is None
@@ -1233,7 +1262,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if is_conv_state_dim_first()
             else self_kv_cache[0].transpose(-1, -2)
         )
-        ssm_state = self_kv_cache[1]
+        ssm_state = None if linq_bits() else self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
@@ -1401,22 +1430,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )
-            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
-                a=a[:num_decode_tokens],
-                b=b[:num_decode_tokens],
-                dt_bias=self.dt_bias,
-                q=query_decode,
-                k=key_decode,
-                v=value_decode,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                    : attn_metadata.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if linq_bits():  # LINQ-STATE: packed-int state decode
+                buf = torch.empty(
+                    (num_decode_tokens, 1, self.num_v_heads // self.tp_size, self.head_v_dim),
+                    dtype=core_attn_out.dtype, device=core_attn_out.device)
+                core_attn_out_decode = linq_gdn_decode(
+                    self, mixed_qkv_non_spec[:num_decode_tokens],  # type: ignore[index]
+                    a[:num_decode_tokens], b[:num_decode_tokens],
+                    self.A_log, self.dt_bias, self.head_k_dim**-0.5,
+                    non_spec_state_indices_tensor[:num_decode_tokens],  # type: ignore[index]
+                    buf,
+                    self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size,
+                    self.head_k_dim, self.head_v_dim,
+                ).transpose(0, 1)
+            else:
+                core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=a[:num_decode_tokens],
+                    b=b[:num_decode_tokens],
+                    dt_bias=self.dt_bias,
+                    q=query_decode,
+                    k=key_decode,
+                    v=value_decode,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=True,
+                )
         else:
             core_attn_out_decode = None
 
@@ -1430,7 +1473,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
+            if linq_bits():  # LINQ-STATE: dequantize the slots we continue from
+                initial_state = linq_unpack_slots(
+                    self, prefill_state_indices,
+                    self._linq_scratch(prefill_state_indices.shape[0], query_non_spec.device))
+            else:
+                initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
             (
                 core_attn_out_non_spec,
@@ -1449,7 +1497,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
             # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if linq_bits():  # LINQ-STATE: prefill->decode handoff, pack once per sequence
+                linq_pack_slots_gdn(self, prefill_state_indices, last_recurrent_state)
+            else:
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1458,25 +1509,40 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     [core_attn_out_decode, core_attn_out_non_spec], dim=1
                 )
         elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    a=a,
-                    b=b,
-                    dt_bias=self.dt_bias,
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_decodes
-                        + 1  # type: ignore[attr-defined]
-                    ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
+            if linq_bits():  # LINQ-STATE: packed-int state decode
+                nb = attn_metadata.num_decodes
+                buf = torch.empty(
+                    (nb, 1, self.num_v_heads // self.tp_size, self.head_v_dim),
+                    dtype=core_attn_out.dtype, device=core_attn_out.device)
+                core_attn_out_non_spec = linq_gdn_decode(
+                    self, mixed_qkv_non_spec[:nb], a[:nb], b[:nb],
+                    self.A_log, self.dt_bias, self.head_k_dim**-0.5,
+                    non_spec_state_indices_tensor[:nb],  # type: ignore[index]
+                    buf,
+                    self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size,
+                    self.head_k_dim, self.head_v_dim,
+                ).transpose(0, 1)
+                last_recurrent_state = None
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                            : attn_metadata.num_decodes
+                            + 1  # type: ignore[attr-defined]
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
                 )
-            )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
@@ -1513,7 +1579,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if is_conv_state_dim_first()
             else self_kv_cache[0].transpose(-1, -2)
         )
-        ssm_state = self_kv_cache[1]
+        ssm_state = None if linq_bits() else self_kv_cache[1]
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
@@ -1581,7 +1647,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if is_conv_state_dim_first()
             else self_kv_cache[0].transpose(-1, -2)
         )
-        ssm_state = self_kv_cache[1]
+        ssm_state = None if linq_bits() else self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
@@ -1601,6 +1667,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             validate_data=False,
         )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        slots = non_spec_state_indices_tensor[:num_actual_tokens]  # type: ignore[index]
+        if linq_bits():  # LINQ-STATE: packed-int state decode, same packed buffer as vendor
+            linq_gdn_decode(
+                self, mixed_qkv_non_spec, a, b, self.A_log, self.dt_bias,
+                self.head_k_dim**-0.5, slots, out_buf,
+                self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size,
+                self.head_k_dim, self.head_v_dim,
+            )
+            return
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
@@ -1610,7 +1685,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             scale=self.head_k_dim**-0.5,
             initial_state=ssm_state,
             out=out_buf,
-            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+            ssm_state_indices=slots,
             use_qk_l2norm_in_kernel=True,
         )
         return

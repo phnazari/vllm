@@ -32,31 +32,49 @@ def _pools(mixer):
     (index-OOB) or OOMs (both observed at the b=128 bench).
     """
     kv = mixer.kv_cache
-    if len(kv) < 4 or kv[2].numel() == 0:
+    if len(kv) < 3 or kv[1].numel() == 0:
         return None
-    return kv[2], kv[3]
+    return kv[1], kv[2]  # conv, codes, scales -- the fp state is prefill scratch
+
+
+# Launch configs for nemotron's shape, swept with the same cold-L2 recipe as vLLM's own fp
+# kernel (scripts/investigate/vllm_baseline_launch_tune.py, H100, 2026-08-21).
+_TUNED_VLLM = {
+    (8, 1): (8, 2), (8, 2): (16, 4), (8, 4): (8, 1), (8, 8): (8, 1),
+    (8, 16): (32, 2), (8, 32): (32, 2), (8, 64): (32, 2), (8, 128): (32, 2),
+    (4, 1): (32, 8), (4, 2): (32, 8), (4, 4): (32, 4), (4, 8): (32, 4),
+    (4, 16): (64, 4), (4, 32): (64, 4), (4, 64): (64, 4), (4, 128): (64, 4),
+}
+
+
+def _pin_launch(mod, bits, batch):
+    """Pin the int kernel's launch config; nearest measured batch at or below `batch`."""
+    for b in (128, 64, 32, 16, 8, 4, 2, 1):
+        if b <= batch and (bits, b) in _TUNED_VLLM:
+            mod.BLOCK_SIZE_M_OVERRIDE, mod.NUM_WARPS_OVERRIDE = _TUNED_VLLM[(bits, b)]
+            return
 
 
 @torch.no_grad()
-def linq_pack_slots(mixer, ssm_state, state_indices, states):
+def linq_pack_slots(mixer, state_indices, states):
     """Pack ``states`` (fp [n, H, D, N]) into the slots ``state_indices`` (prefill handoff)."""
-    from linquant.real_state import pack_state
+    from linquant.kernels.state_int.pack_state_kernel import pack_state_to_slots
 
     pools = _pools(mixer)
     if pools is None:  # profiling-phase dummy cache
         return
     codes, scales = pools
-    p = pack_state(states.to(torch.float32), _BITS, 128)
-    codes[state_indices] = p.codes
-    assert p.scales.shape[-1] == 1, p.scales.shape  # one 128-block per row
-    scales[state_indices] = p.scales.squeeze(-1)
+    pack_state_to_slots(states.contiguous(), codes, scales, state_indices, _BITS)
 
 
 @torch.no_grad()
-def linq_decode(mixer, ssm_state, x, dt, A, B, C, D, dt_bias, state_indices_in,
+def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
                 state_indices_out, out, num_accepted_tokens, cu_seqlens):
     """Int-state decode step; mirrors the ``selective_state_update`` call it replaces."""
-    from linquant.kernels.state_int.selective_state_update_int import selective_state_update_int
+    import importlib
+
+    ssu = importlib.import_module("linquant.kernels.state_int.selective_state_update_int")
+    selective_state_update_int = ssu.selective_state_update_int
 
     # Phase 1 scope: no spec decode, no mamba prefix caching (src slot object == dst slot
     # object holds exactly in that regime; identity check only — no sync under graph capture).
@@ -72,6 +90,7 @@ def linq_decode(mixer, ssm_state, x, dt, A, B, C, D, dt_bias, state_indices_in,
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
+    _pin_launch(ssu, _BITS, x.shape[0])
     selective_state_update_int(
         codes,
         scales,
@@ -88,3 +107,103 @@ def linq_decode(mixer, ssm_state, x, dt, A, B, C, D, dt_bias, state_indices_in,
         out=out,
         null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
     )
+
+
+@torch.no_grad()
+def linq_unpack_slots(mixer, state_indices, out):
+    """Dequantize slots into `out` (chunked-prefill continuation reads the int pool)."""
+    from linquant.kernels.state_int.pack_state_kernel import unpack_state_from_slots
+
+    codes, scales = _pools(mixer)
+    return unpack_state_from_slots(out, codes, scales, state_indices, _BITS)
+
+
+# Gated DeltaNet (qwen3_next / qwen3_5): value-grouped int state in vLLM's own value-major
+# [slots, HV, V, K] layout, so pack_state's per-row grouping is already the right axis.
+
+
+@torch.no_grad()
+def linq_pack_slots_gdn(mixer, state_indices, states):
+    """Pack ``states`` (fp [n, HV, V, K]) into the slots ``state_indices`` (prefill handoff)."""
+    from linquant.kernels.state_int.pack_state_kernel import pack_state_to_slots
+
+    pools = _pools(mixer)
+    if pools is None:  # profiling-phase dummy cache
+        return
+    codes, scales = pools
+    pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales,
+                        state_indices, _BITS)
+
+
+# (BV, warps, stages) per (bits, batch), same recipe as the fp arm above.
+_TUNED_GDN = {
+    (8, 1): (16, 4, 2), (8, 2): (8, 1, 3), (8, 4): (8, 1, 3), (8, 8): (8, 1, 2),
+    (8, 16): (8, 1, 3), (8, 32): (8, 1, 3), (8, 64): (8, 1, 2), (8, 128): (8, 1, 1),
+    (4, 1): (8, 1, 3), (4, 2): (8, 1, 3), (4, 4): (16, 1, 3), (4, 8): (8, 1, 2),
+    (4, 16): (16, 1, 2), (4, 32): (16, 1, 2), (4, 64): (16, 1, 2), (4, 128): (16, 1, 2),
+}
+
+
+def _load_tuned_gdn():
+    """Override the baked table from the tuner's JSON when LINQ_GDN_TUNED_JSON points at one."""
+    path = os.environ.get("LINQ_GDN_TUNED_JSON")
+    if not path or not os.path.exists(path):
+        return _TUNED_GDN
+    import json
+
+    raw = json.load(open(path))
+    return {(int(arm[3:]), int(b)): tuple(cfg)
+            for arm, d in raw.items() if arm.startswith("int") for b, cfg in d.items()}
+
+
+_TUNED_GDN = _load_tuned_gdn() if os.environ.get("LINQ_GDN_TUNED_JSON") else _TUNED_GDN
+
+
+def _gdn_launch(bits, batch):
+    for b in (128, 64, 32, 16, 8, 4, 2, 1):
+        if b <= batch and (bits, b) in _TUNED_GDN:
+            return _TUNED_GDN[(bits, b)]
+    return (None, None, None)
+
+
+@torch.no_grad()
+def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices, out,
+                    H, HV, K, V):
+    """Int-state GDN decode step; replaces ``fused_recurrent_gated_delta_rule_packed_decode``.
+
+    Reads the packed qkv buffer directly, exactly like the vendor kernel it replaces, so the
+    int arm pays no extra split/copy. ``out`` is [B, 1, HV, V].
+    """
+    from linquant.kernels.state_int.fused_recurrent_gdn_int import fused_recurrent_gdn_int_vf
+
+    pools = _pools(mixer)
+    assert pools is not None, "LINQ int state: decode before cache pools are bound"
+    codes, scales = pools
+    nb = mixed_qkv.shape[0]
+    bv, nw, ns = _gdn_launch(_BITS, nb)
+    o, _ = fused_recurrent_gdn_int_vf(
+        None,
+        None,
+        None,
+        codes,
+        scales,
+        g=a.reshape(nb, 1, -1),
+        beta=b.reshape(nb, 1, -1),
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_beta_sigmoid_in_kernel=True,
+        allow_neg_eigval=False,
+        bits=_BITS,
+        bv=bv,
+        num_warps=nw,
+        num_stages=ns,
+        state_indices=state_indices,
+        null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
+        mixed_qkv=mixed_qkv,
+        shape=(nb, H, HV, K, V),
+        out=out,
+    )
+    return o

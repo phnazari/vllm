@@ -22,6 +22,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.linq_state_int import (  # LINQ-STATE
+    linq_bits,
+    linq_unpack_slots,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
@@ -527,6 +531,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # Check if running on Blackwell (SM100+) for kernel tuning
         self.is_blackwell = current_platform.is_device_capability_family(100)
 
+    def _linq_scratch(self, n, dtype, device):
+        """Prefill-only fp state buffer: sized to the batch, never part of the page."""
+        shape = (n, self.num_heads // self.tp_size, self.head_dim, self.ssm_state_size)
+        buf = getattr(self, "_linq_scratch_buf", None)
+        if buf is None or buf.shape[0] < n or buf.dtype != dtype:
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            self._linq_scratch_buf = buf
+        return buf[:n]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -591,7 +604,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Triton's autotuner includes tensor dtypes in its cache key,
         # so state_dtype must match what real inference uses.
-        ssm_state_dtype = self.get_state_dtype()[1]  # LINQ-STATE: tuple may carry extra entries
+        # LINQ-STATE: the int arms' cache entry [1] is uint8 codes; the fp state they warm up
+        # (and later use as prefill scratch) is fp32.
+        ssm_state_dtype = torch.float32 if linq_bits() else self.get_state_dtype()[1]
 
         # SSD kernel autotune keys depend on dtype and head dimensions,
         # not on sequence length or batch size, so a single shape suffices.
@@ -701,7 +716,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 if is_conv_state_dim_first()
                 else self.kv_cache[0].transpose(-1, -2)
             )
-            ssm_state = self.kv_cache[1]
+            # LINQ-STATE: the int arms have no fp pool -- kv_cache[1:] is codes/scales and the
+            # fp state is per-batch scratch, so nothing below may touch `ssm_state`.
+            ssm_state = None if linq_bits() else self.kv_cache[1]
+            assert not (linq_bits() and is_mamba_cache_all), (
+                "LINQ int state: mamba_cache_mode must be 'none'"
+            )
             has_initial_states_p = attn_metadata.has_initial_states_p
             prep_initial_states = attn_metadata.prep_initial_states
             chunk_size = attn_metadata.chunk_size
@@ -837,11 +857,18 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     kernel_ssm_indices = state_indices_tensor_p.gather(
                         1, block_idx_last_computed_token_p.unsqueeze(1)
                     ).squeeze(1)
-                initial_states = torch.where(
-                    has_initial_states_p[:, None, None, None],
-                    ssm_state[kernel_ssm_indices],
-                    0,
-                )
+                if linq_bits():  # LINQ-STATE: dequantize the slots we continue from
+                    scratch = self._linq_scratch(
+                        kernel_ssm_indices.shape[0], torch.float32, hidden_states_p.device)
+                    linq_unpack_slots(self, kernel_ssm_indices, scratch)
+                    initial_states = torch.where(
+                        has_initial_states_p[:, None, None, None], scratch, 0)
+                else:
+                    initial_states = torch.where(
+                        has_initial_states_p[:, None, None, None],
+                        ssm_state[kernel_ssm_indices],
+                        0,
+                    )
 
             # NOTE: final output is an in-place update of out tensor
             assert preallocated_ssm_out_p is not None
@@ -866,7 +893,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
-                state_dtype=ssm_state.dtype,
+                state_dtype=torch.float32 if linq_bits() else ssm_state.dtype,
             )
 
             if is_mamba_cache_all:
@@ -953,17 +980,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 # - varlen state is a (num_prefills, nheads, headdim, dstate)
                 #   tensor
                 assert state_indices_tensor_p is not None
-                ssm_state[state_indices_tensor_p] = varlen_states
+                if not linq_bits():
+                    ssm_state[state_indices_tensor_p] = varlen_states
 
                 # LINQ-STATE: prefill->decode handoff — pack the fresh final states into
                 # the packed-int pools; decode below reads/writes only those.
-                from vllm.model_executor.layers.mamba.linq_state_int import (
-                    linq_bits,
-                    linq_pack_slots,
-                )
+                from vllm.model_executor.layers.mamba.linq_state_int import linq_pack_slots
 
                 if linq_bits():
-                    linq_pack_slots(self, ssm_state, state_indices_tensor_p, varlen_states)
+                    linq_pack_slots(self, state_indices_tensor_p, varlen_states)
 
         # Process decode requests
         if has_decode:
@@ -1039,15 +1064,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
             # NOTE: final output is an in-place update of out tensor
 
             # LINQ-STATE: decode on the packed-int state pools instead of ssm_state.
-            from vllm.model_executor.layers.mamba.linq_state_int import (
-                linq_bits,
-                linq_decode,
-            )
+            from vllm.model_executor.layers.mamba.linq_state_int import linq_decode
 
             if linq_bits():
                 linq_decode(
                     self,
-                    ssm_state,
                     hidden_states_d,
                     dt_d,
                     A_d,

@@ -79,11 +79,11 @@ class MambaStateDtypeCalculator:
         dtypes = cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
-        # LINQ-STATE: packed codes (uint8) + per-row scales (fp32) as accounted state.
+        # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
         from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
 
         if linq_bits():
-            dtypes = (*dtypes, torch.uint8, torch.float32)
+            dtypes = (dtypes[0], torch.uint8, torch.float32)
         return dtypes
 
     @classmethod
@@ -116,10 +116,16 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType = "auto",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return cls._mamba_state_dtype(
+    ) -> tuple[torch.dtype, ...]:
+        dtypes = cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
+        # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
+        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+
+        if linq_bits():
+            dtypes = (dtypes[0], torch.uint8, torch.float32)
+        return dtypes
 
     @classmethod
     def kda_state_dtype(
@@ -191,7 +197,8 @@ class MambaStateShapeCalculator:
         #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
 
-        # LINQ-STATE: codes [H, D, state*bits/8] + scales [H, D] (per-row, state_size == 128).
+        # LINQ-STATE: the int arms keep ONLY codes [H, D, state*bits/8] + scales [H, D] per
+        # slot; the fp state is prefill scratch, so it never enters the page.
         from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
 
         bits = linq_bits()
@@ -199,7 +206,6 @@ class MambaStateShapeCalculator:
             code_w = {4: state_size // 2, 6: 3 * state_size // 4, 8: state_size}[bits]
             return (
                 conv_state_shape,
-                temporal_state_shape,
                 (divide(num_heads, tp_world_size), head_dim, code_w),
                 (divide(num_heads, tp_world_size), head_dim),
             )
@@ -250,6 +256,20 @@ class MambaStateShapeCalculator:
             head_v_dim,
             head_k_dim,
         )
+
+        # LINQ-STATE: value-grouped int state ONLY (same value-major layout as the fp pool);
+        # the fp state is prefill scratch, so it never enters the page.
+        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+
+        bits = linq_bits()
+        if bits:
+            code_w = {4: head_k_dim // 2, 6: 3 * head_k_dim // 4, 8: head_k_dim}[bits]
+            hv = divide(num_v_heads, tp_world_size)
+            return (
+                conv_state_shape,
+                (hv, head_v_dim, code_w),
+                (hv, head_v_dim),
+            )
         return conv_state_shape, temporal_state_shape
 
     @classmethod
