@@ -53,10 +53,14 @@ def _unrotate_norm_kernel(
     x = tl.load(x_ptr + row * stride_x + off).to(tl.float32)
     if ROTATE:
         NH: tl.constexpr = group_size // head_dim
-        # row form of @ R with R = diag(signs) @ H/sqrt(d): out = H (signs*y) / sqrt(d),
-        # so the signs go on FIRST and the Hadamard second
+        # This is the INVERSE, so it applies R^T, not R. Row form of @ R^T with
+        # R = diag(signs) @ H/sqrt(d): R^T = H @ diag(signs)/sqrt(d), so out = (y @ H) * s,
+        # i.e. Hadamard FIRST and the signs second -- the mirror of the conv, which does
+        # signs first. Flipped 2026-08-23 together with the conv: before that the conv
+        # applied R^T and this applied R, an exact-round-trip pair that nonetheless
+        # quantized the state in a basis where the random signs changed no magnitude.
         sg = tl.load(signs_ptr + (off % head_dim)).to(tl.float32)
-        x = x * sg * (1.0 / tl.sqrt(float(head_dim)))
+        x = x * (1.0 / tl.sqrt(float(head_dim)))
         x = _fwht_stage(x, NH, head_dim, 1)
         x = _fwht_stage(x, NH, head_dim, 2)
         x = _fwht_stage(x, NH, head_dim, 4)
@@ -64,6 +68,7 @@ def _unrotate_norm_kernel(
         x = _fwht_stage(x, NH, head_dim, 16)
         x = _fwht_stage(x, NH, head_dim, 32)
         x = _fwht_stage(x, NH, head_dim, 64)
+        x = x * sg
 
     g = tl.load(g_ptr + row * stride_g + off).to(tl.float32)
     x = x * (g / (1.0 + tl.exp(-g)))  # silu gate, before the RMS

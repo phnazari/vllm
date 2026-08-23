@@ -105,14 +105,17 @@ def mamba2_spec(mixer):
 
 
 def linq_unrotate_x(x, rmat):
-    """Undo the conv rotation: rows go back through R = diag(signs) @ H_d / sqrt(d).
+    """Undo the conv rotation: rows go back through R^T, R = diag(signs) @ H_d / sqrt(d).
 
-    The conv emits y_row = x_row @ R^T, so the row-form inverse is y_row @ R -- signs on
-    the ROW axis of H, not the column. Verified numerically.
+    The conv emits y_row = x_row @ R (signs first, then the butterfly), so the row-form
+    inverse is y_row @ R^T. Until 2026-08-23 the conv applied R^T and this applied R -- a
+    consistent pair, so the round trip was exact, but the state was then quantized in the
+    R^T basis where |y @ H @ diag(s)| == |y @ H| and the random signs changed no magnitude
+    at all. Both sides moved together; they must stay that way.
 
     Called from inside vLLM's Mixer2RMSNormGated, ahead of the gate and the RMS, so
     everything else that norm does -- dispatch, the TP collectives, the weight
     multiply -- stays vLLM's. ponytail: dense per-head matmul, fuse into the norm
     kernel if a profile says it matters.
     """
-    return (x.reshape(-1, rmat.shape[0]) @ rmat.to(x.dtype)).reshape(x.shape)
+    return (x.reshape(-1, rmat.shape[0]) @ rmat.T.to(x.dtype)).reshape(x.shape)

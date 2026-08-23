@@ -46,10 +46,20 @@ def _rot_spec(idx_feats, mask_feats, signs_ptr, log2dim_ptr, ROT_D: tl.constexpr
 @triton.jit()
 def _rotate(acc, d, scale, mask_feats, BLOCK_N: tl.constexpr, DMAX: tl.constexpr,
             ROT_D: tl.constexpr):
-    """y <- diag(signs) H_d y / sqrt(d) per 2^k-aligned head, in registers (see the .cu twin)."""
+    """y_row <- y_row @ R with R = diag(signs) @ H_d / sqrt(d), per 2^k-aligned head.
+
+    SIGNS GO ON FIRST. Row-form, ``y @ (diag(s) @ H) == (y * s) @ H`` -- the signs index the
+    INPUT channel, then the butterfly mixes. Applying them after the stages instead computes
+    ``y @ H @ diag(s)``, i.e. R-TRANSPOSE, and because |H y * s| == |H y| elementwise that
+    leaves every absmax-based quantizer blind to the randomization: the randomized Hadamard
+    degenerates to a plain one whose channel 0 is the raw DC sum. It cost nothing in
+    output-preservation terms (the un-rotation is R's transpose either way, so the round trip
+    stayed exact) which is exactly why it survived until the 2026-08-23 audit.
+    """
     UNIFORM: tl.constexpr = ROT_D > 0
     NG: tl.constexpr = BLOCK_N // DMAX
     x = tl.where(mask_feats, acc, 0.0).to(tl.float32)
+    x = x * scale
     x = _fwht_stage(x, d, BLOCK_N, NG, DMAX, 1, UNIFORM)
     x = _fwht_stage(x, d, BLOCK_N, NG, DMAX, 2, UNIFORM)
     x = _fwht_stage(x, d, BLOCK_N, NG, DMAX, 4, UNIFORM)
@@ -57,7 +67,6 @@ def _rotate(acc, d, scale, mask_feats, BLOCK_N: tl.constexpr, DMAX: tl.constexpr
     x = _fwht_stage(x, d, BLOCK_N, NG, DMAX, 16, UNIFORM)
     x = _fwht_stage(x, d, BLOCK_N, NG, DMAX, 32, UNIFORM)
     x = _fwht_stage(x, d, BLOCK_N, NG, DMAX, 64, UNIFORM)
-    x = x * scale
     if UNIFORM:
         return x.to(acc.dtype)
     return tl.where(d > 1, x, acc).to(acc.dtype)
