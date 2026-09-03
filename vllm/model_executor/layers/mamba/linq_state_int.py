@@ -20,6 +20,8 @@ _BITS = int(os.environ.get("LINQ_STATE_BITS", "0") or 0)
 # captured into the graph would replay the same dither every step, which stalls under decay
 # exactly like RTN -- tests/test_state_int_sr.py.)
 _SR = os.environ.get("LINQ_STATE_SR") == "1"
+if _BITS:
+    print(f"LINQ-STATE: int{_BITS} state, stochastic rounding {'ON' if _SR else 'OFF'}", flush=True)
 
 
 def linq_bits() -> int:
