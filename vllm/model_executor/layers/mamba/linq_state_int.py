@@ -14,6 +14,12 @@ import os
 import torch
 
 _BITS = int(os.environ.get("LINQ_STATE_BITS", "0") or 0)
+# Stochastic rounding in the decode requant (LINQ_STATE_SR=1). The per-row seed is the
+# request's sequence length: it advances every decode step, and it lives in the model
+# runner's persistent buffer, so CUDA-graph replays see the new value. (A host-side seed
+# captured into the graph would replay the same dither every step, which stalls under decay
+# exactly like RTN -- tests/test_state_int_sr.py.)
+_SR = os.environ.get("LINQ_STATE_SR") == "1"
 
 
 def linq_bits() -> int:
@@ -69,7 +75,7 @@ def linq_pack_slots(mixer, state_indices, states):
 
 @torch.no_grad()
 def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
-                state_indices_out, out, num_accepted_tokens, cu_seqlens):
+                state_indices_out, out, num_accepted_tokens, cu_seqlens, seq_lens=None):
     """Int-state decode step; mirrors the ``selective_state_update`` call it replaces."""
     import importlib
 
@@ -106,6 +112,7 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
         bits=_BITS,
         out=out,
         null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
+        sr_seed=seq_lens[: x.shape[0]] if _SR else None,
     )
 
 
@@ -168,7 +175,7 @@ def _gdn_launch(bits, batch):
 
 @torch.no_grad()
 def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices, out,
-                    H, HV, K, V):
+                    H, HV, K, V, seq_lens=None):
     """Int-state GDN decode step; replaces ``fused_recurrent_gated_delta_rule_packed_decode``.
 
     Reads the packed qkv buffer directly, exactly like the vendor kernel it replaces, so the
@@ -205,6 +212,7 @@ def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices
         mixed_qkv=mixed_qkv,
         shape=(nb, H, HV, K, V),
         out=out,
+        sr_seed=seq_lens[:nb] if _SR else None,
     )
     return o
 

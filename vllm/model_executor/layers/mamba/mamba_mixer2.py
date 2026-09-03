@@ -1142,6 +1142,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
                     num_accepted_tokens,
                     query_start_loc_d,
+                    seq_lens=attn_metadata.seq_lens,  # decode rows come first; SR seed
                 )
             else:
                 selective_state_update(

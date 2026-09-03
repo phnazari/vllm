@@ -1442,6 +1442,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     buf,
                     self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size,
                     self.head_k_dim, self.head_v_dim,
+                    seq_lens=attn_metadata.seq_lens,
                 ).transpose(0, 1)
             else:
                 core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
@@ -1521,6 +1522,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     buf,
                     self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size,
                     self.head_k_dim, self.head_v_dim,
+                    seq_lens=attn_metadata.seq_lens,
                 ).transpose(0, 1)
                 last_recurrent_state = None
             else:
@@ -1674,6 +1676,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.head_k_dim**-0.5, slots, out_buf,
                 self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size,
                 self.head_k_dim, self.head_v_dim,
+                seq_lens=attn_metadata.seq_lens,
             )
             return
         fused_recurrent_gated_delta_rule_packed_decode(
