@@ -114,7 +114,7 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
         bits=_BITS,
         out=out,
         null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
-        sr_seed=seq_lens[: x.shape[0]] if _SR else None,
+        sr_seed=seq_lens if _SR else None,  # unsliced: a per-call view costs ~4 us of host time per layer
     )
 
 
@@ -214,7 +214,7 @@ def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices
         mixed_qkv=mixed_qkv,
         shape=(nb, H, HV, K, V),
         out=out,
-        sr_seed=seq_lens[:nb] if _SR else None,
+        sr_seed=seq_lens if _SR else None,  # unsliced, see linq_decode
     )
     return o
 
