@@ -51,26 +51,38 @@ def layer_index(prefix: str) -> int:
 
 
 class OnlineHadamard(nn.Module):
-    """x -> H.(D.x) on the last axis (fp32), H the get_hadK Kronecker Hadamard of size n."""
+    """x -> H.(D.x) on the last axis (fp32), H the get_hadK Kronecker Hadamard of size n.
+
+    Same numerics as ``utils.hadamard_utils.matmul_hadU_cuda`` on the torch fallback (the HF eval
+    path), but written so that torch.compile's full-graph capture (vLLM serving) can trace it:
+    everything is resolved at construction, ``forward`` is plain tensor ops.
+    """
 
     def __init__(self, n: int, sign: torch.Tensor | None = None):
         super().__init__()
-        with torch.device("cpu"):  # hadamard_utils builds on the default device (CUDA under vLLM); keep CPU, move lazily
-            had_K, K = _hadamard_utils().get_hadK(n)
+        hu = _hadamard_utils()
+        with torch.device("cpu"):  # hadamard_utils builds on the default device (CUDA under vLLM)
+            had_K, K = hu.get_hadK(n)
+        dev = torch.get_default_device()
+        if dev.type != "cuda" and torch.cuda.is_available():
+            dev = torch.device("cuda")
         self.K = K
-        self.register_buffer("had_K", had_K if had_K is not None else torch.zeros(0), persistent=False)
-        self.register_buffer("sign", sign if sign is not None else torch.zeros(0), persistent=False)
+        self._fwht = importlib.import_module("utils.utils")._hadamard_transform_torch  # the fallback HadamardTransform runs
+        self._sqrt_n = float(torch.tensor(n).sqrt())  # == matmul_hadU_cuda's torch.tensor(n).sqrt() in fp32
+        self.register_buffer("had_K", (had_K.float() if had_K is not None else torch.zeros(0)).to(dev), persistent=False)
+        self.register_buffer("sign", (sign if sign is not None else torch.zeros(0)).to(dev), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        matmul_hadU_cuda = _hadamard_utils().matmul_hadU_cuda
-        if self.had_K.numel() and self.had_K.device != x.device:
-            self.had_K = self.had_K.to(x.device)
         if self.sign.numel():
-            if self.sign.device != x.device:
-                self.sign = self.sign.to(x.device)
             x = x * self.sign.to(x.dtype)
-        had_K = self.had_K if self.had_K.numel() else None
-        return matmul_hadU_cuda(x.float(), had_K, self.K).to(x.dtype)
+        X = x.float()
+        n = X.shape[-1]
+        if self.K == 1:
+            out = self._fwht(X.contiguous()) / self._sqrt_n
+        else:
+            inp = self._fwht(X.reshape(-1, self.K, n // self.K).contiguous()) / self._sqrt_n
+            out = (self.had_K @ inp).reshape(X.shape)
+        return out.to(x.dtype)
 
 
 def r4_sign(n: int, prefix: str) -> torch.Tensor:
