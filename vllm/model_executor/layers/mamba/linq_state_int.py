@@ -245,6 +245,36 @@ def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices
     return o
 
 
+_GDN_KERNEL = os.environ.get("LINQ_GDN_KERNEL", "vf")  # vf: fla-derived (default, the sweeps so far); vllm: copy of vLLM's fused_sigmoid_gating kernel
+
+
+def linq_gdn_kernel() -> str:
+    """Which int8 GDN decode kernel the mixer runs (LINQ_GDN_KERNEL=vllm|vf)."""
+    assert _GDN_KERNEL in ("vllm", "vf"), _GDN_KERNEL
+    return _GDN_KERNEL
+
+
+def linq_gdn_decode_vllm(mixer, q, k, v, a, b, A_log, dt_bias, scale, cu_seqlens, state_indices, seq_lens=None):
+    """Int-state GDN decode with the copy of vLLM's own kernel (fused_sigmoid_gating_int).
+
+    Same arguments as vLLM's ``fused_sigmoid_gating_delta_rule_update`` call at the decode
+    sites (q/k/v are the rearranged ``[1, T, H, K]`` tensors); returns ``o`` shaped like it.
+    """
+    from linquant.kernels.state_int.fused_sigmoid_gating_int import fused_sigmoid_gating_delta_rule_update_int
+
+    pools = _pools(mixer)
+    assert pools is not None, "LINQ int state: decode before cache pools are bound"
+    codes, scales = pools
+    assert _BITS == 8, "the vLLM-kernel copy is int8 only"
+    return fused_sigmoid_gating_delta_rule_update_int(
+        A_log, a, b, dt_bias, q, k, v, codes, scales, state_indices,
+        scale=scale, cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True,
+        sr_seed=seq_lens if _SR else None,  # unsliced persistent buffer, see linq_decode
+        sr_salt=_layer_salt(mixer) if _SR else 0,
+        asym=_ASYM, fast=os.environ.get("LINQ_STATE_FAST", "1") != "0",
+    )
+
+
 # --- parity probe -------------------------------------------------------------------------
 # Does the vLLM decode path inject the same quantization error as the HF fake-quant harness
 # that produced the accuracy campaign? The two stacks cannot agree bitwise (different chunk
