@@ -573,6 +573,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
         is_symmetric = weight_quant.symmetric and input_quant.symmetric
+        # int4 weights + *fp8* activations; without the type check an int8-activation
+        # W4A8 config (llm-compressor W4A8) is routed to the fp8 kernel on SM90.
+        is_float_act = input_quant.type == QuantizationType.FLOAT
         # Only per-group symmetric weight (4bit)
         # + per-tok symmetric activation (8bit) quantization supported.
         return (
@@ -581,6 +584,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_token
             and is_symmetric
             and is_dynamic
+            and is_float_act
         )
 
     @classmethod
