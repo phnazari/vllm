@@ -153,7 +153,7 @@ def linq_pack_slots_gdn(mixer, state_indices, states):
         return
     codes, scales = pools
     pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales,
-                        state_indices, _BITS)
+                        state_indices, _BITS, asym=_ASYM)
 
 
 # (BV, warps, stages) per (bits, batch), same recipe as the fp arm above.
@@ -199,7 +199,6 @@ def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices
 
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
-    assert not _ASYM, "LINQ_STATE_ASYM: mamba2 only (the GDN recipe is symmetric)"
     codes, scales = pools
     nb = mixed_qkv.shape[0]
     bv, nw, ns = _gdn_launch(_BITS, nb)
@@ -228,6 +227,7 @@ def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices
         shape=(nb, H, HV, K, V),
         out=out,
         sr_seed=seq_lens if _SR else None,  # unsliced, see linq_decode
+        asym=_ASYM,
     )
     return o
 

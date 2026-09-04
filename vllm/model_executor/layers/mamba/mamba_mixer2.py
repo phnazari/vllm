@@ -511,6 +511,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        from vllm.model_executor.layers.linq_wa_rotate import make_ro  # LINQ-WA-ROT
+
+        self.linq_ro = make_ro(intermediate_size)
 
         self.norm = Mixer2RMSNormGated(
             intermediate_size,
@@ -617,6 +620,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
         hidden_states = self.norm(ssm_output, gate)
 
         # 5. Final linear projection
+        if self.linq_ro is not None:  # LINQ-WA-ROT: online R_o, inverse folded into out_proj
+            hidden_states = self.linq_ro(hidden_states)
         output, _ = self.out_proj(hidden_states)
 
         return output

@@ -113,11 +113,16 @@ class NemotronHMLP(nn.Module):
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
+        from vllm.model_executor.layers.linq_wa_rotate import make_r4  # LINQ-WA-ROT
+
+        self.linq_r4 = make_r4(intermediate_size, prefix)
         self.act_fn = ReLUSquaredActivation()
 
     def forward(self, x: torch.Tensor):
         x, _ = self.up_proj(x)
         x = self.act_fn(x)
+        if self.linq_r4 is not None:  # LINQ-WA-ROT: online (signed) R4, inverse folded into down_proj
+            x = self.linq_r4(x)
         x, _ = self.down_proj(x)
         return x
 

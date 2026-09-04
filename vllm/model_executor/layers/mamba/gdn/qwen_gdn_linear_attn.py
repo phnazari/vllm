@@ -480,6 +480,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        from vllm.model_executor.layers.linq_wa_rotate import make_ro  # LINQ-WA-ROT
+
+        self.linq_ro = make_ro(self.value_dim)
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
@@ -810,6 +813,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
+        if self.linq_ro is not None:  # LINQ-WA-ROT: online R_o, inverse folded into out_proj
+            core_attn_out = self.linq_ro(core_attn_out)
         output, _ = self.out_proj(core_attn_out)
         return output
 
@@ -955,6 +960,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
+        if self.linq_ro is not None:  # LINQ-WA-ROT
+            core_attn_out = self.linq_ro(core_attn_out)
         out, _ = self.out_proj(core_attn_out)
         return out
 
@@ -1005,6 +1012,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
+        if self.linq_ro is not None:  # LINQ-WA-ROT
+            core_attn_out = self.linq_ro(core_attn_out)
         out, _ = self.out_proj(core_attn_out)
         return out
 

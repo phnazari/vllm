@@ -169,6 +169,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
+            from vllm.model_executor.layers.linq_wa_rotate import make_r4  # LINQ-WA-ROT
+
+            self.mlp.linq_r4 = make_r4(config.intermediate_size, f"{prefix}.mlp")
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
 

@@ -258,17 +258,14 @@ class MambaStateShapeCalculator:
 
         # LINQ-STATE: value-grouped int state ONLY (same value-major layout as the fp pool);
         # the fp state is prefill scratch, so it never enters the page.
-        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+        from vllm.model_executor.layers.mamba.linq_state_int import linq_asym, linq_bits
 
         bits = linq_bits()
         if bits:
             code_w = {4: head_k_dim // 2, 6: 3 * head_k_dim // 4, 8: head_k_dim}[bits]
             hv = divide(num_v_heads, tp_world_size)
-            return (
-                conv_state_shape,
-                (hv, head_v_dim, code_w),
-                (hv, head_v_dim),
-            )
+            scales_shape = (hv, head_v_dim, 2) if linq_asym() else (hv, head_v_dim)
+            return (conv_state_shape, (hv, head_v_dim, code_w), scales_shape)
         return conv_state_shape, temporal_state_shape
 
     @classmethod

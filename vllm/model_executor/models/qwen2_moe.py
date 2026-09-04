@@ -112,6 +112,9 @@ class Qwen2MoeMLP(nn.Module):
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
+        linq_r4 = getattr(self, "linq_r4", None)  # LINQ-WA-ROT (set by qwen3_5.py): online R4
+        if linq_r4 is not None:
+            out = linq_r4(out)
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
