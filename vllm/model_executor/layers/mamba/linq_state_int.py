@@ -275,6 +275,21 @@ def linq_gdn_decode_vllm(mixer, q, k, v, a, b, A_log, dt_bias, scale, cu_seqlens
     )
 
 
+def linq_gdn_decode_packed_vllm(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices, out, seq_lens=None):
+    """Int-state GDN decode-only step with the copy of vLLM's packed kernel (reads [q|k|v] directly)."""
+    from linquant.kernels.state_int.fused_sigmoid_gating_int import fused_recurrent_gated_delta_rule_packed_decode_int
+
+    pools = _pools(mixer)
+    assert pools is not None, "LINQ int state: decode before cache pools are bound"
+    codes, scales = pools
+    assert _BITS == 8, "the vLLM-kernel copy is int8 only"
+    return fused_recurrent_gated_delta_rule_packed_decode_int(
+        mixed_qkv, a, b, A_log, dt_bias, scale, codes, scales, out, state_indices, use_qk_l2norm_in_kernel=True,
+        sr_seed=seq_lens if _SR else None, sr_salt=_layer_salt(mixer) if _SR else 0,
+        asym=_ASYM, fast=os.environ.get("LINQ_STATE_FAST", "1") != "0",
+    )
+
+
 # --- parity probe -------------------------------------------------------------------------
 # Does the vLLM decode path inject the same quantization error as the HF fake-quant harness
 # that produced the accuracy campaign? The two stacks cannot agree bitwise (different chunk
