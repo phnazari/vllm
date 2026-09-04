@@ -20,8 +20,14 @@ _BITS = int(os.environ.get("LINQ_STATE_BITS", "0") or 0)
 # captured into the graph would replay the same dither every step, which stalls under decay
 # exactly like RTN -- tests/test_state_int_sr.py.)
 _SR = os.environ.get("LINQ_STATE_SR") == "1"
+# Asymmetric (affine) INT8 grid, LINQ_STATE_ASYM=1: the Nemotron-H recipe ``int8_block_asym_sr``.
+# The scales pool then carries two fp32 per row (scale, min); mamba2 only.
+_ASYM = os.environ.get("LINQ_STATE_ASYM") == "1"
+if _ASYM and _BITS != 8:
+    raise ValueError("LINQ_STATE_ASYM=1 needs LINQ_STATE_BITS=8")
 if _BITS:
-    print(f"LINQ-STATE: int{_BITS} state, stochastic rounding {'ON' if _SR else 'OFF'}", flush=True)
+    print(f"LINQ-STATE: int{_BITS} state, {'asymmetric' if _ASYM else 'symmetric'} grid, "
+          f"stochastic rounding {'ON' if _SR else 'OFF'}", flush=True)
 
 
 def linq_bits() -> int:
@@ -29,6 +35,11 @@ def linq_bits() -> int:
     if _BITS and _BITS not in (4, 6, 8):
         raise ValueError(f"LINQ_STATE_BITS={_BITS} unsupported (want 4, 6 or 8)")
     return _BITS
+
+
+def linq_asym() -> bool:
+    """Affine INT8 grid (two fp32 per scales row)."""
+    return _ASYM
 
 
 def _pools(mixer):
@@ -72,7 +83,7 @@ def linq_pack_slots(mixer, state_indices, states):
     if pools is None:  # profiling-phase dummy cache
         return
     codes, scales = pools
-    pack_state_to_slots(states.contiguous(), codes, scales, state_indices, _BITS)
+    pack_state_to_slots(states.contiguous(), codes, scales, state_indices, _BITS, asym=_ASYM)
 
 
 @torch.no_grad()
@@ -115,6 +126,7 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
         out=out,
         null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
         sr_seed=seq_lens if _SR else None,  # unsliced: a per-call view costs ~4 us of host time per layer
+        asym=_ASYM,
     )
 
 
@@ -124,7 +136,7 @@ def linq_unpack_slots(mixer, state_indices, out):
     from linquant.kernels.state_int.pack_state_kernel import unpack_state_from_slots
 
     codes, scales = _pools(mixer)
-    return unpack_state_from_slots(out, codes, scales, state_indices, _BITS)
+    return unpack_state_from_slots(out, codes, scales, state_indices, _BITS, asym=_ASYM)
 
 
 # Gated DeltaNet (qwen3_next / qwen3_5): value-grouped int state in vLLM's own value-major
@@ -187,6 +199,7 @@ def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices
 
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
+    assert not _ASYM, "LINQ_STATE_ASYM: mamba2 only (the GDN recipe is symmetric)"
     codes, scales = pools
     nb = mixed_qkv.shape[0]
     bv, nw, ns = _gdn_launch(_BITS, nb)

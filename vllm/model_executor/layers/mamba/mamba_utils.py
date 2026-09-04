@@ -198,17 +198,16 @@ class MambaStateShapeCalculator:
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
 
         # LINQ-STATE: the int arms keep ONLY codes [H, D, state*bits/8] + scales [H, D] per
-        # slot; the fp state is prefill scratch, so it never enters the page.
-        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+        # slot; the fp state is prefill scratch, so it never enters the page. The asymmetric
+        # grid stores (scale, min) per row: scales [H, D, 2].
+        from vllm.model_executor.layers.mamba.linq_state_int import linq_asym, linq_bits
 
         bits = linq_bits()
         if bits:
             code_w = {4: state_size // 2, 6: 3 * state_size // 4, 8: state_size}[bits]
-            return (
-                conv_state_shape,
-                (divide(num_heads, tp_world_size), head_dim, code_w),
-                (divide(num_heads, tp_world_size), head_dim),
-            )
+            heads = divide(num_heads, tp_world_size)
+            scales_shape = (heads, head_dim, 2) if linq_asym() else (heads, head_dim)
+            return (conv_state_shape, (heads, head_dim, code_w), scales_shape)
         return conv_state_shape, temporal_state_shape
 
     @classmethod
