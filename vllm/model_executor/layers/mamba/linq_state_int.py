@@ -20,6 +20,7 @@ _BITS = int(os.environ.get("LINQ_STATE_BITS", "0") or 0)
 # captured into the graph would replay the same dither every step, which stalls under decay
 # exactly like RTN -- tests/test_state_int_sr.py.)
 _SR = os.environ.get("LINQ_STATE_SR") == "1"
+_PACK_SEED = __import__("itertools").count(1)  # prefill handoff runs eagerly: a host counter is graph-safe here
 # Asymmetric (affine) INT8 grid, LINQ_STATE_ASYM=1: the Nemotron-H recipe ``int8_block_asym_sr``.
 # The scales pool then carries two fp32 per row (scale, min); mamba2 only.
 _ASYM = os.environ.get("LINQ_STATE_ASYM") == "1"
@@ -83,7 +84,8 @@ def linq_pack_slots(mixer, state_indices, states):
     if pools is None:  # profiling-phase dummy cache
         return
     codes, scales = pools
-    pack_state_to_slots(states.contiguous(), codes, scales, state_indices, _BITS, asym=_ASYM)
+    pack_state_to_slots(states.contiguous(), codes, scales, state_indices, _BITS, asym=_ASYM,
+                        sr_seed=next(_PACK_SEED) if _SR else None)
 
 
 @torch.no_grad()
@@ -153,7 +155,7 @@ def linq_pack_slots_gdn(mixer, state_indices, states):
         return
     codes, scales = pools
     pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales,
-                        state_indices, _BITS, asym=_ASYM)
+                        state_indices, _BITS, asym=_ASYM, sr_seed=next(_PACK_SEED) if _SR else None)
 
 
 # (BV, warps, stages) per (bits, batch), same recipe as the fp arm above.
