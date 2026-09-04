@@ -38,6 +38,15 @@ def linq_bits() -> int:
     return _BITS
 
 
+def _layer_salt(mixer) -> int:
+    """Layer index from the mixer's prefix ('...layers.N...'): decorrelates the SR noise across layers."""
+    import re
+
+    m = re.search(r"layers\.(\d+)", getattr(mixer, "prefix", "") or "")
+    assert m, f"LINQ SR: no layer index in mixer prefix {getattr(mixer, 'prefix', None)!r}"
+    return int(m.group(1)) + 1
+
+
 def linq_asym() -> bool:
     """Affine INT8 grid (two fp32 per scales row)."""
     return _ASYM
@@ -129,6 +138,7 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
         null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
         sr_seed=seq_lens if _SR else None,  # unsliced: a per-call view costs ~4 us of host time per layer
         asym=_ASYM,
+        sr_salt=_layer_salt(mixer) if _SR else 0,
     )
 
 
@@ -230,6 +240,7 @@ def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices
         out=out,
         sr_seed=seq_lens if _SR else None,  # unsliced, see linq_decode
         asym=_ASYM,
+        sr_salt=_layer_salt(mixer) if _SR else 0,
     )
     return o
 

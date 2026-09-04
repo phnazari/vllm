@@ -471,6 +471,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=current_platform.current_device(),
         )
 
+        self.prefix = prefix  # LINQ-STATE: per-layer SR salt
         self.out_proj = RowParallelLinear(
             self.value_dim,
             self.hidden_size,
