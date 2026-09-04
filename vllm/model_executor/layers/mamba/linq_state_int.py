@@ -192,6 +192,11 @@ def _load_tuned_gdn():
 _TUNED_GDN = _load_tuned_gdn() if os.environ.get("LINQ_GDN_TUNED_JSON") else _TUNED_GDN
 
 
+def _launch_or_none(t):
+    """(BV, warps, stages) or None when the table has no entry (the kernel copy then uses vLLM's stock launch)."""
+    return None if t[0] is None else t
+
+
 def _gdn_launch(bits, batch):
     for b in (128, 64, 32, 16, 8, 4, 2, 1):
         if b <= batch and (bits, b) in _TUNED_GDN:
@@ -286,6 +291,26 @@ def linq_gdn_decode_packed_vllm(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, s
     return fused_recurrent_gated_delta_rule_packed_decode_int(
         mixed_qkv, a, b, A_log, dt_bias, scale, codes, scales, out, state_indices, use_qk_l2norm_in_kernel=True,
         sr_seed=seq_lens if _SR else None, sr_salt=_layer_salt(mixer) if _SR else 0,
+        asym=_ASYM, fast=os.environ.get("LINQ_STATE_FAST", "1") != "0",
+        launch=_launch_or_none(_gdn_launch(_BITS, mixed_qkv.shape[0])),  # tuned (BV, warps, stages) for the copy (qwen_gdn_decode_vllmk.json via LINQ_GDN_TUNED_JSON); vLLM's stock launch when untuned
+    )
+
+
+# Kimi-Linear (KDA): value-grouped int8 pool in vLLM's own [slots, H, V, K] layout, decode on the
+# copy of vLLM's fused_recurrent_kda (rule 2026-09-04: INT state only on copies of vLLM's own kernel).
+def linq_kda_decode_vllm(mixer, q, k, v, g, beta, cu_seqlens, state_indices, seq_lens=None):
+    """Int-state KDA decode step; same arguments as vLLM's ``fused_recurrent_kda`` call site."""
+    from linquant.kernels.state_int.fused_recurrent_kda_vllm_int import fused_recurrent_kda_int
+
+    pools = _pools(mixer)
+    assert pools is not None, "LINQ int state: decode before cache pools are bound"
+    codes, scales = pools
+    assert _BITS == 8, "the vLLM-kernel copy is int8 only"
+    return fused_recurrent_kda_int(
+        q, k, v, g, beta, None, codes, scales, state_indices,
+        cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True,
+        sr_seed=seq_lens if _SR else None,  # unsliced persistent buffer, see linq_decode
+        sr_salt=_layer_salt(mixer) if _SR else 0,
         asym=_ASYM, fast=os.environ.get("LINQ_STATE_FAST", "1") != "0",
     )
 

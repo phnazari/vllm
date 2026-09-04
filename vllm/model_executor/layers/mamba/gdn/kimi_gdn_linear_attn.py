@@ -230,6 +230,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def _linq_scratch(self, n, device):
+        """Prefill-only fp32 state buffer, sized to the batch -- never part of the page (LINQ-STATE)."""
+        heads = self.local_num_heads
+        buf = getattr(self, "_linq_scratch_buf", None)
+        if buf is None or buf.shape[0] < n:
+            buf = torch.empty((n, heads, self.head_dim, self.head_dim), dtype=torch.float32, device=device)
+            self._linq_scratch_buf = buf
+        return buf[:n]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -300,7 +309,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
-        (conv_state, recurrent_state) = constant_caches
+        # LINQ-STATE: (conv, codes, scales) under the int state; the fp state is prefill scratch
+        from vllm.model_executor.layers.mamba.linq_state_int import (
+            linq_bits, linq_kda_decode_vllm, linq_pack_slots_gdn, linq_unpack_slots)
+
+        conv_state = constant_caches[0]
+        recurrent_state = None if linq_bits() else constant_caches[1]
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         if not is_conv_state_dim_first():
@@ -394,9 +408,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata_narrowed.num_prefills > 0:
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
-            zero_idx = non_spec_state_indices_tensor[~has_initial_state]
-            recurrent_state[zero_idx] = 0
-            initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
+            if linq_bits():  # LINQ-STATE: dequantize the slots we continue from into scratch
+                initial_state = linq_unpack_slots(
+                    self, non_spec_state_indices_tensor,
+                    self._linq_scratch(non_spec_state_indices_tensor.shape[0], q.device))
+                initial_state[~has_initial_state, ...] = 0
+            else:
+                zero_idx = non_spec_state_indices_tensor[~has_initial_state]
+                recurrent_state[zero_idx] = 0
+                initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -414,7 +434,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu_seqlens=non_spec_query_start_loc,
             )
             # Init cache
-            recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+            if linq_bits():  # LINQ-STATE: prefill->decode handoff, pack once per sequence
+                linq_pack_slots_gdn(self, non_spec_state_indices_tensor, last_recurrent_state)
+            else:
+                recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
         else:
             assert non_spec_query_start_loc is not None
             g1 = fused_kda_gate(
@@ -423,22 +446,29 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.head_dim,
                 g_bias=self.dt_bias,
             ).unsqueeze(0)
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = fused_recurrent_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g1,
-                beta=beta,
-                initial_state=recurrent_state,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc[
-                    : attn_metadata_narrowed.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
-            )
+            if linq_bits():  # LINQ-STATE: copy of vLLM's fused_recurrent_kda on the int8 pool
+                core_attn_out_non_spec = linq_kda_decode_vllm(
+                    self, q, k, v, g1, beta,
+                    non_spec_query_start_loc[: attn_metadata_narrowed.num_decodes + 1],
+                    non_spec_state_indices_tensor, seq_lens=attn_metadata_narrowed.seq_lens,
+                )
+            else:
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = fused_recurrent_kda(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g1,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=non_spec_query_start_loc[
+                        : attn_metadata_narrowed.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                )
         core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
             0, :num_actual_tokens
         ]

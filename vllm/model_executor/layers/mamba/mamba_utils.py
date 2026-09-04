@@ -134,6 +134,11 @@ class MambaStateDtypeCalculator:
         mamba_cache_dtype: MambaDType,
     ) -> tuple[torch.dtype, torch.dtype]:
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+        # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
+        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+
+        if linq_bits():
+            return (state_dtype, torch.uint8, torch.float32)
         return (state_dtype, torch.float32)
 
 
@@ -292,6 +297,16 @@ class MambaStateShapeCalculator:
             divide(conv_dim, tp_world_size), conv_kernel_size - 1
         )
         recurrent_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
+        # LINQ-STATE: value-grouped int state in vLLM's own value-major [H, V, K] layout
+        # (fused_recurrent_kda indexes the pool as [.., V, K]); the fp state is prefill scratch.
+        from vllm.model_executor.layers.mamba.linq_state_int import linq_asym, linq_bits
+
+        bits = linq_bits()
+        if bits:
+            assert bits == 8, "KDA int state: the vLLM-kernel copy is int8 only"
+            heads = divide(num_heads, tp_world_size)
+            scales_shape = (heads, head_dim, 2) if linq_asym() else (heads, head_dim)
+            return (conv_state_shape, (heads, head_dim, head_dim), scales_shape)
         return (conv_state_shape, recurrent_state_shape)
 
 
