@@ -245,7 +245,7 @@ def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices
     return o
 
 
-_GDN_KERNEL = os.environ.get("LINQ_GDN_KERNEL", "vf")  # vf: fla-derived (default, the sweeps so far); vllm: copy of vLLM's fused_sigmoid_gating kernel
+_GDN_KERNEL = os.environ.get("LINQ_GDN_KERNEL", "vllm")  # vllm (default, Philipp 2026-09-04): copy of vLLM's fused_sigmoid_gating kernel + INT-STATE; vf: fla-derived
 
 
 def linq_gdn_kernel() -> str:
