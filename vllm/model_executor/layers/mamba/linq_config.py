@@ -91,3 +91,39 @@ class LinqConfig:
         return (f"LINQ-STATE: int{self.state_bits} state, {'asymmetric' if self.state_asym else 'symmetric'} grid, "
                 f"stochastic rounding {'ON' if self.state_sr else 'OFF'}, {'fast' if self.state_fast else 'exact'} codec"
                 + (f", wa_rot={','.join(sorted(self.wa_rot))}" if self.wa_rot else ""))
+
+
+# --- process-wide resolved config ------------------------------------------------------------
+# The model classes call ``set_current(vllm_config)`` from their ``get_mamba_state_*_from_config``
+# hooks (the first LINQ-aware code that sees the VllmConfig); layers call ``current()`` at init.
+_RESOLVED: LinqConfig | None = None
+
+
+def set_current(vllm_config) -> LinqConfig:
+    """Resolve from ``vllm_config`` and pin it for the process (idempotent for an equal config)."""
+    global _RESOLVED
+    cfg = LinqConfig.from_vllm_config(vllm_config)
+    if _RESOLVED is None:
+        _RESOLVED = cfg
+        if cfg.state_bits or cfg.wa_rot:
+            print(cfg.banner(), flush=True)
+    elif cfg != _RESOLVED:
+        raise RuntimeError(f"LINQ: conflicting configs in one process: {_RESOLVED} vs {cfg}")
+    return _RESOLVED
+
+
+def current() -> LinqConfig:
+    """The pinned config; else the active ``VllmConfig`` context (model construction); else the env fallback."""
+    global _RESOLVED
+    if _RESOLVED is None:
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+
+            vc = get_current_vllm_config_or_none()
+        except Exception:  # noqa: BLE001 - outside an engine (tests, HF harness)
+            vc = None
+        cfg = LinqConfig.from_vllm_config(vc)
+        if vc is not None:
+            return set_current(vc)
+        return cfg  # env fallback, not pinned: a later set_current(vllm_config) wins
+    return _RESOLVED
