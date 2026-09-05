@@ -94,10 +94,15 @@ class KimiMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        from vllm.model_executor.layers.linq_wa_rotate import make_r4  # LINQ-WA-ROT
+
+        self.linq_r4 = make_r4(intermediate_size, prefix)
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        if self.linq_r4 is not None:  # LINQ-WA-ROT: online R4, inverse folded into down_proj
+            x = self.linq_r4(x)
         x, _ = self.down_proj(x)
         return x
 
@@ -151,6 +156,12 @@ class KimiMoE(nn.Module):
         else:
             self.shared_experts = None
 
+        from vllm.model_executor.layers.fused_moe.modular_kernel import linq_set_expert_r4
+        from vllm.model_executor.layers.linq_wa_rotate import make_r4  # LINQ-WA-ROT
+
+        _r4 = make_r4(moe_intermediate_size, f"{prefix}.experts")  # routed experts: hook inside the MoE kernel
+        if _r4 is not None:
+            linq_set_expert_r4(_r4)
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=num_experts,

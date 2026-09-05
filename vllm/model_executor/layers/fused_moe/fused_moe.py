@@ -1751,6 +1751,10 @@ def fused_experts_impl(
     apply_moe_activation(
         activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
     )
+    from vllm.model_executor.layers.fused_moe import modular_kernel as _mk  # LINQ-WA-ROT (see modular_kernel)
+
+    if _mk._LINQ_R4 is not None and intermediate_cache2.shape[-1] == _mk._LINQ_R4.n:
+        intermediate_cache2.copy_(_mk._LINQ_R4(intermediate_cache2))
 
     qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
         A=intermediate_cache2,

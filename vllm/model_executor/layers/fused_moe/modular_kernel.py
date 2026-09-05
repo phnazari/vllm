@@ -760,6 +760,18 @@ class FusedMoEExperts(ABC):
         return False
 
 
+# LINQ-WA-ROT: the down_proj-input Hadamard (R4) of the ROUTED experts. The expert kernels have no layer
+# identity, so this is one module-level H shared by every MoE layer -- exact for plain "r4" (unsigned),
+# which is what the Kimi export folds; "r4s" (per-layer signs) would need a per-layer hook.
+# ponytail: global keyed on the intermediate width; per-instance binding if r4s is ever needed here.
+_LINQ_R4 = None
+
+
+def linq_set_expert_r4(h) -> None:
+    global _LINQ_R4
+    _LINQ_R4 = h
+
+
 class FusedMoEExpertsModular(FusedMoEExperts):
     """
     An abstract base class for the [Permute-Experts-Unpermute] step described
@@ -902,6 +914,8 @@ class FusedMoEExpertsModular(FusedMoEExperts):
             topk_ids=topk_ids,
             expert_map=expert_map,
         )
+        if _LINQ_R4 is not None and output.shape[-1] == _LINQ_R4.n:  # LINQ-WA-ROT: R4 before the 2nd GEMM
+            output.copy_(_LINQ_R4(output))
 
     @abstractmethod
     def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:

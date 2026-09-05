@@ -217,6 +217,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.g_b_proj",
         )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        from vllm.model_executor.layers.linq_wa_rotate import make_ro  # LINQ-WA-ROT
+
+        self.linq_ro = make_ro(projection_size)  # KDA o_proj-input Hadamard (inverse folded at export)
         self.o_proj = RowParallelLinear(
             projection_size,
             self.hidden_size,
@@ -274,6 +277,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+        if self.linq_ro is not None:  # LINQ-WA-ROT
+            core_attn_out = self.linq_ro(core_attn_out)
         output[:] = self.o_proj(core_attn_out)[0]
 
     def _forward(

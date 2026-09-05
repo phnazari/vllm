@@ -64,6 +64,7 @@ class OnlineHadamard(nn.Module):
         if dev.type != "cuda" and torch.cuda.is_available():
             dev = torch.device("cuda")
         self.K = K
+        self.n = n
         self._fwht = importlib.import_module("utils.utils")._hadamard_transform_torch  # the fallback HadamardTransform runs
         self._sqrt_n = float(torch.tensor(n).sqrt())  # == matmul_hadU_cuda's torch.tensor(n).sqrt() in fp32
         self.register_buffer("had_K", (had_K.float() if had_K is not None else torch.zeros(0)).to(dev), persistent=False)
