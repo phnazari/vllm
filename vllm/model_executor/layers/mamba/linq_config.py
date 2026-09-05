@@ -86,11 +86,11 @@ class LinqConfig:
 
     def banner(self) -> str:
         """The one-line description the runners grep for (``LINQ-STATE: ...``)."""
+        rot = f", wa_rot={','.join(sorted(self.wa_rot))}" if self.wa_rot else ""  # W/A rows: the FP32-state arm needs it too
         if not self.state_bits:
-            return "LINQ-STATE: off"
+            return "LINQ-STATE: off" + rot
         return (f"LINQ-STATE: int{self.state_bits} state, {'asymmetric' if self.state_asym else 'symmetric'} grid, "
-                f"stochastic rounding {'ON' if self.state_sr else 'OFF'}, {'fast' if self.state_fast else 'exact'} codec"
-                + (f", wa_rot={','.join(sorted(self.wa_rot))}" if self.wa_rot else ""))
+                f"stochastic rounding {'ON' if self.state_sr else 'OFF'}, {'fast' if self.state_fast else 'exact'} codec" + rot)
 
 
 # --- process-wide resolved config ------------------------------------------------------------
