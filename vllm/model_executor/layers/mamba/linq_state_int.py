@@ -13,29 +13,14 @@ import os
 
 import torch
 
-_BITS = int(os.environ.get("LINQ_STATE_BITS", "0") or 0)
-# Stochastic rounding in the decode requant (LINQ_STATE_SR=1). The per-row seed is the
-# request's sequence length: it advances every decode step, and it lives in the model
-# runner's persistent buffer, so CUDA-graph replays see the new value. (A host-side seed
-# captured into the graph would replay the same dither every step, which stalls under decay
-# exactly like RTN -- tests/test_state_int_sr.py.)
-_SR = os.environ.get("LINQ_STATE_SR") == "1"
+from vllm.model_executor.layers.mamba.linq_config import LinqConfig, current as linq_config  # noqa: F401
+
 _PACK_SEED = __import__("itertools").count(1)  # prefill handoff runs eagerly: a host counter is graph-safe here
-# Asymmetric (affine) INT8 grid, LINQ_STATE_ASYM=1: the Nemotron-H recipe ``int8_block_asym_sr``.
-# The scales pool then carries two fp32 per row (scale, min); mamba2 only.
-_ASYM = os.environ.get("LINQ_STATE_ASYM") == "1"
-if _ASYM and _BITS != 8:
-    raise ValueError("LINQ_STATE_ASYM=1 needs LINQ_STATE_BITS=8")
-if _BITS:
-    print(f"LINQ-STATE: int{_BITS} state, {'asymmetric' if _ASYM else 'symmetric'} grid, "
-          f"stochastic rounding {'ON' if _SR else 'OFF'}", flush=True)
 
 
 def linq_bits() -> int:
-    """0 = disabled, else 4/6/8."""
-    if _BITS and _BITS not in (4, 6, 8):
-        raise ValueError(f"LINQ_STATE_BITS={_BITS} unsupported (want 4, 6 or 8)")
-    return _BITS
+    """0 = disabled, else 4/6/8 (validated by LinqConfig)."""
+    return linq_config().state_bits
 
 
 def _layer_salt(mixer) -> int:
@@ -49,7 +34,7 @@ def _layer_salt(mixer) -> int:
 
 def linq_asym() -> bool:
     """Affine INT8 grid (two fp32 per scales row)."""
-    return _ASYM
+    return linq_config().state_asym
 
 
 def _pools(mixer):
@@ -93,8 +78,8 @@ def linq_pack_slots(mixer, state_indices, states):
     if pools is None:  # profiling-phase dummy cache
         return
     codes, scales = pools
-    pack_state_to_slots(states.contiguous(), codes, scales, state_indices, _BITS, asym=_ASYM,
-                        sr_seed=next(_PACK_SEED) if _SR else None)
+    pack_state_to_slots(states.contiguous(), codes, scales, state_indices, linq_config().state_bits, asym=linq_config().state_asym,
+                        sr_seed=next(_PACK_SEED) if linq_config().state_sr else None)
 
 
 @torch.no_grad()
@@ -120,7 +105,7 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
-    _pin_launch(ssu, _BITS, x.shape[0])
+    _pin_launch(ssu, linq_config().state_bits, x.shape[0])
     selective_state_update_int(
         codes,
         scales,
@@ -133,12 +118,12 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
         dt_bias=dt_bias,
         dt_softplus=True,
         state_batch_indices=state_indices_in,
-        bits=_BITS,
+        bits=linq_config().state_bits,
         out=out,
         null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
-        sr_seed=seq_lens if _SR else None,  # unsliced: a per-call view costs ~4 us of host time per layer
-        asym=_ASYM,
-        sr_salt=_layer_salt(mixer) if _SR else 0,
+        sr_seed=seq_lens if linq_config().state_sr else None,  # unsliced: a per-call view costs ~4 us of host time per layer
+        asym=linq_config().state_asym,
+        sr_salt=_layer_salt(mixer) if linq_config().state_sr else 0,
     )
 
 
@@ -148,7 +133,7 @@ def linq_unpack_slots(mixer, state_indices, out):
     from linquant.kernels.state_int.pack_state_kernel import unpack_state_from_slots
 
     codes, scales = _pools(mixer)
-    return unpack_state_from_slots(out, codes, scales, state_indices, _BITS, asym=_ASYM)
+    return unpack_state_from_slots(out, codes, scales, state_indices, linq_config().state_bits, asym=linq_config().state_asym)
 
 
 # Gated DeltaNet (qwen3_next / qwen3_5): value-grouped int state in vLLM's own value-major
@@ -165,7 +150,7 @@ def linq_pack_slots_gdn(mixer, state_indices, states):
         return
     codes, scales = pools
     pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales,
-                        state_indices, _BITS, asym=_ASYM, sr_seed=next(_PACK_SEED) if _SR else None)
+                        state_indices, linq_config().state_bits, asym=linq_config().state_asym, sr_seed=next(_PACK_SEED) if linq_config().state_sr else None)
 
 
 # (BV, warps, stages) per (bits, batch), same recipe as the fp arm above.
@@ -205,58 +190,6 @@ def _gdn_launch(bits, batch):
 
 
 @torch.no_grad()
-def linq_gdn_decode(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices, out,
-                    H, HV, K, V, seq_lens=None):
-    """Int-state GDN decode step; replaces ``fused_recurrent_gated_delta_rule_packed_decode``.
-
-    Reads the packed qkv buffer directly, exactly like the vendor kernel it replaces, so the
-    int arm pays no extra split/copy. ``out`` is [B, 1, HV, V].
-    """
-    from linquant.kernels.state_int.fused_recurrent_gdn_int import fused_recurrent_gdn_int_vf
-
-    pools = _pools(mixer)
-    assert pools is not None, "LINQ int state: decode before cache pools are bound"
-    codes, scales = pools
-    nb = mixed_qkv.shape[0]
-    bv, nw, ns = _gdn_launch(_BITS, nb)
-    o, _ = fused_recurrent_gdn_int_vf(
-        None,
-        None,
-        None,
-        codes,
-        scales,
-        g=a.reshape(nb, 1, -1),
-        beta=b.reshape(nb, 1, -1),
-        scale=scale,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        use_beta_sigmoid_in_kernel=True,
-        allow_neg_eigval=False,
-        bits=_BITS,
-        bv=bv,
-        num_warps=nw,
-        num_stages=ns,
-        state_indices=state_indices,
-        null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
-        mixed_qkv=mixed_qkv,
-        shape=(nb, H, HV, K, V),
-        out=out,
-        sr_seed=seq_lens if _SR else None,  # unsliced, see linq_decode
-        asym=_ASYM,
-        sr_salt=_layer_salt(mixer) if _SR else 0,
-    )
-    return o
-
-
-_GDN_KERNEL = os.environ.get("LINQ_GDN_KERNEL", "vllm")  # vllm (default, Philipp 2026-09-04): copy of vLLM's fused_sigmoid_gating kernel + INT-STATE; vf: fla-derived
-
-
-def linq_gdn_kernel() -> str:
-    """Which int8 GDN decode kernel the mixer runs (LINQ_GDN_KERNEL=vllm|vf)."""
-    assert _GDN_KERNEL in ("vllm", "vf"), _GDN_KERNEL
-    return _GDN_KERNEL
 
 
 def linq_gdn_decode_vllm(mixer, q, k, v, a, b, A_log, dt_bias, scale, cu_seqlens, state_indices, seq_lens=None):
@@ -270,13 +203,13 @@ def linq_gdn_decode_vllm(mixer, q, k, v, a, b, A_log, dt_bias, scale, cu_seqlens
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
-    assert _BITS == 8, "the vLLM-kernel copy is int8 only"
+    assert linq_config().state_bits == 8, "the vLLM-kernel copy is int8 only"
     return fused_sigmoid_gating_delta_rule_update_int(
         A_log, a, b, dt_bias, q, k, v, codes, scales, state_indices,
         scale=scale, cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True,
-        sr_seed=seq_lens if _SR else None,  # unsliced persistent buffer, see linq_decode
-        sr_salt=_layer_salt(mixer) if _SR else 0,
-        asym=_ASYM, fast=os.environ.get("LINQ_STATE_FAST", "1") != "0",
+        sr_seed=seq_lens if linq_config().state_sr else None,  # unsliced persistent buffer, see linq_decode
+        sr_salt=_layer_salt(mixer) if linq_config().state_sr else 0,
+        asym=linq_config().state_asym, fast=linq_config().state_fast,
     )
 
 
@@ -287,12 +220,12 @@ def linq_gdn_decode_packed_vllm(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, s
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
-    assert _BITS == 8, "the vLLM-kernel copy is int8 only"
+    assert linq_config().state_bits == 8, "the vLLM-kernel copy is int8 only"
     return fused_recurrent_gated_delta_rule_packed_decode_int(
         mixed_qkv, a, b, A_log, dt_bias, scale, codes, scales, out, state_indices, use_qk_l2norm_in_kernel=True,
-        sr_seed=seq_lens if _SR else None, sr_salt=_layer_salt(mixer) if _SR else 0,
-        asym=_ASYM, fast=os.environ.get("LINQ_STATE_FAST", "1") != "0",
-        launch=_launch_or_none(_gdn_launch(_BITS, mixed_qkv.shape[0])),  # tuned (BV, warps, stages) for the copy (qwen_gdn_decode_vllmk.json via LINQ_GDN_TUNED_JSON); vLLM's stock launch when untuned
+        sr_seed=seq_lens if linq_config().state_sr else None, sr_salt=_layer_salt(mixer) if linq_config().state_sr else 0,
+        asym=linq_config().state_asym, fast=linq_config().state_fast,
+        launch=_launch_or_none(_gdn_launch(linq_config().state_bits, mixed_qkv.shape[0])),  # tuned (BV, warps, stages) for the copy (qwen_gdn_decode_vllmk.json via LINQ_GDN_TUNED_JSON); vLLM's stock launch when untuned
     )
 
 
@@ -305,13 +238,13 @@ def linq_kda_decode_vllm(mixer, q, k, v, g, beta, cu_seqlens, state_indices, seq
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
-    assert _BITS == 8, "the vLLM-kernel copy is int8 only"
+    assert linq_config().state_bits == 8, "the vLLM-kernel copy is int8 only"
     return fused_recurrent_kda_int(
         q, k, v, g, beta, None, codes, scales, state_indices,
         cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True,
-        sr_seed=seq_lens if _SR else None,  # unsliced persistent buffer, see linq_decode
-        sr_salt=_layer_salt(mixer) if _SR else 0,
-        asym=_ASYM, fast=os.environ.get("LINQ_STATE_FAST", "1") != "0",
+        sr_seed=seq_lens if linq_config().state_sr else None,  # unsliced persistent buffer, see linq_decode
+        sr_salt=_layer_salt(mixer) if linq_config().state_sr else 0,
+        asym=linq_config().state_asym, fast=linq_config().state_fast,
     )
 
 
@@ -328,7 +261,7 @@ _DUMPED: set[str] = set()
 @torch.no_grad()
 def linq_dump_handoff_state(mixer, varlen_states) -> None:
     """Persist ``varlen_states`` (fp [n, H, D, N]) for ``mixer`` to $LINQ_DUMP_STATE."""
-    d = os.environ.get("LINQ_DUMP_STATE")
+    d = linq_config().dump_state_dir
     if not d:
         return
     key = getattr(mixer, "prefix", "") or f"layer{len(_DUMPED)}"

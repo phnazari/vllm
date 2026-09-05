@@ -31,16 +31,13 @@ def _hadamard_utils():
             u.__path__.append(os.path.join(root, "utils"))
         return importlib.import_module("utils.hadamard_utils")
 
-_WA = {r for r in os.environ.get("LINQ_WA_ROT", "").lower().split(",") if r}
-if _WA - {"r4", "r4s", "ro"}:
-    raise ValueError(f"LINQ_WA_ROT={os.environ.get('LINQ_WA_ROT')} unsupported (want r4 | r4s, ro)")
-if {"r4", "r4s"} <= _WA:
-    raise ValueError("LINQ_WA_ROT: r4 and r4s are exclusive")
+from vllm.model_executor.layers.mamba.linq_config import current as _linq_config
 
 
 def wa_rot(kind: str) -> bool:
     """True when 'r4' (either flavour) or 'ro' is enabled."""
-    return kind in _WA or (kind == "r4" and "r4s" in _WA)
+    wa = _linq_config().wa_rot
+    return kind in wa or (kind == "r4" and "r4s" in wa)
 
 
 def layer_index(prefix: str) -> int:

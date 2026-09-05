@@ -29,6 +29,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
 )
+from vllm.model_executor.layers.mamba.linq_config import set_current as linq_set_config
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -602,6 +603,7 @@ class KimiLinearForCausalLM(
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, torch.dtype]:
+        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
         return MambaStateDtypeCalculator.kda_state_dtype(
             vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
         )
@@ -610,6 +612,7 @@ class KimiLinearForCausalLM(
     def get_mamba_state_shape_from_config(
         cls, vllm_config: "VllmConfig"
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        linq_set_config(vllm_config)  # LINQ-STATE: pin the serving config for this process
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_config
         tp_size = parallel_config.tensor_parallel_size

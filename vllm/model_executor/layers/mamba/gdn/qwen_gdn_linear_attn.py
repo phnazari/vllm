@@ -29,10 +29,8 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.linq_state_int import (
     linq_bits,
-    linq_gdn_decode,
     linq_gdn_decode_packed_vllm,
     linq_gdn_decode_vllm,
-    linq_gdn_kernel,
     linq_pack_slots_gdn,
     linq_unpack_slots,
 )
@@ -1443,27 +1441,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )
-            if linq_bits() and linq_gdn_kernel() == "vllm":  # LINQ-STATE: copy of vLLM's kernel, int8 pool
+            if linq_bits():  # LINQ-STATE: copy of vLLM's kernel, int8 pool
                 core_attn_out_decode = linq_gdn_decode_vllm(
                     self, query_decode, key_decode, value_decode, a[:num_decode_tokens], b[:num_decode_tokens],
                     self.A_log, self.dt_bias, self.head_k_dim**-0.5,
                     non_spec_query_start_loc[: attn_metadata.num_decodes + 1],  # type: ignore[index]
                     non_spec_state_indices_tensor, seq_lens=attn_metadata.seq_lens,
                 )
-            elif linq_bits():  # LINQ-STATE: packed-int state decode (fla-derived vf kernel)
-                buf = torch.empty(
-                    (num_decode_tokens, 1, self.num_v_heads // self.tp_size, self.head_v_dim),
-                    dtype=core_attn_out.dtype, device=core_attn_out.device)
-                core_attn_out_decode = linq_gdn_decode(
-                    self, mixed_qkv_non_spec[:num_decode_tokens],  # type: ignore[index]
-                    a[:num_decode_tokens], b[:num_decode_tokens],
-                    self.A_log, self.dt_bias, self.head_k_dim**-0.5,
-                    non_spec_state_indices_tensor[:num_decode_tokens],  # type: ignore[index]
-                    buf,
-                    self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size,
-                    self.head_k_dim, self.head_v_dim,
-                    seq_lens=attn_metadata.seq_lens,
-                ).transpose(0, 1)
             else:
                 core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1530,28 +1514,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     [core_attn_out_decode, core_attn_out_non_spec], dim=1
                 )
         elif attn_metadata.num_decodes > 0:
-            if linq_bits() and linq_gdn_kernel() == "vllm":  # LINQ-STATE: copy of vLLM's kernel, int8 pool
+            if linq_bits():  # LINQ-STATE: copy of vLLM's kernel, int8 pool
                 core_attn_out_non_spec = linq_gdn_decode_vllm(
                     self, query_non_spec, key_non_spec, value_non_spec, a, b, self.A_log, self.dt_bias,
                     self.head_k_dim**-0.5,
                     non_spec_query_start_loc[: attn_metadata.num_decodes + 1],  # type: ignore[index]
                     non_spec_state_indices_tensor, seq_lens=attn_metadata.seq_lens,
                 )
-                last_recurrent_state = None
-            elif linq_bits():  # LINQ-STATE: packed-int state decode (fla-derived vf kernel)
-                nb = attn_metadata.num_decodes
-                buf = torch.empty(
-                    (nb, 1, self.num_v_heads // self.tp_size, self.head_v_dim),
-                    dtype=core_attn_out.dtype, device=core_attn_out.device)
-                core_attn_out_non_spec = linq_gdn_decode(
-                    self, mixed_qkv_non_spec[:nb], a[:nb], b[:nb],
-                    self.A_log, self.dt_bias, self.head_k_dim**-0.5,
-                    non_spec_state_indices_tensor[:nb],  # type: ignore[index]
-                    buf,
-                    self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size,
-                    self.head_k_dim, self.head_v_dim,
-                    seq_lens=attn_metadata.seq_lens,
-                ).transpose(0, 1)
                 last_recurrent_state = None
             else:
                 core_attn_out_non_spec, last_recurrent_state = (
@@ -1698,18 +1667,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         slots = non_spec_state_indices_tensor[:num_actual_tokens]  # type: ignore[index]
-        if linq_bits() and linq_gdn_kernel() == "vllm":  # LINQ-STATE: copy of vLLM's PACKED decode-only kernel, int8 pool
+        if linq_bits():  # LINQ-STATE: copy of vLLM's PACKED decode-only kernel, int8 pool
             linq_gdn_decode_packed_vllm(
                 self, mixed_qkv_non_spec, a, b, self.A_log, self.dt_bias, self.head_k_dim**-0.5, slots, out_buf,
-                seq_lens=attn_metadata.seq_lens,
-            )
-            return
-        if linq_bits():  # LINQ-STATE: packed-int state decode, same packed buffer as vendor
-            linq_gdn_decode(
-                self, mixed_qkv_non_spec, a, b, self.A_log, self.dt_bias,
-                self.head_k_dim**-0.5, slots, out_buf,
-                self.num_k_heads // self.tp_size, self.num_v_heads // self.tp_size,
-                self.head_k_dim, self.head_v_dim,
                 seq_lens=attn_metadata.seq_lens,
             )
             return
