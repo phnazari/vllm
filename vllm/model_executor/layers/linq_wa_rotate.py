@@ -100,7 +100,7 @@ def make_r4(n: int, prefix: str) -> OnlineHadamard | None:
     if not wa_rot("r4"):
         return None
     _no_tp()
-    return OnlineHadamard(n, r4_sign(n, prefix) if "r4s" in _WA else None)
+    return OnlineHadamard(n, r4_sign(n, prefix) if wa_rot("r4s") else None)
 
 
 def make_ro(n: int) -> OnlineHadamard | None:
