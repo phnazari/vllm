@@ -1,10 +1,11 @@
 # LINQ-WA-ROT: the ONLINE Hadamards of LinQuant's W/A-quant pipeline (scripts/investigate/wa_quant.py
 # BEST_STACK, linquant/prepare.py): R4 on every MLP down_proj input and R_o on every recurrent
 # mixer out_proj input. Their inverses are folded into the exported weights, so such a checkpoint
-# is only correct with these switched ON. Flag: LINQ_WA_ROT, comma list of
+# is only correct with these switched ON. LinqConfig.wa_rot (the export's config.json `linq_wa_rot`, or
+# additional_config {"linq": {"wa_rot": ...}}), comma list of
 #   r4   plain R4 (Qwen-3.5)            r4s  sign-flipped R4 H.D, D seeded 1000 + layer index (Nemotron-H)
 #   ro   R_o on the recurrent mixers' out_proj (both models)
-# Independent of LINQ_ROT (the state-side R_k / R_v of linq_rotate.py).
+# Independent of LinqConfig.rot (the state-side R_k / R_v of linq_rotate.py).
 # Numerics: utils.hadamard_utils.matmul_hadU_cuda in fp32, then cast back -- the same code path
 # the HF eval runs (neither venv has fast_hadamard_transform, so both use the torch butterfly).
 import importlib
@@ -97,7 +98,7 @@ def _no_tp() -> None:
 
 
 def make_r4(n: int, prefix: str) -> OnlineHadamard | None:
-    """The down_proj-input Hadamard for LINQ_WA_ROT, or None when off."""
+    """The down_proj-input Hadamard for LinqConfig.wa_rot, or None when off."""
     if not wa_rot("r4"):
         return None
     _no_tp()
@@ -105,7 +106,7 @@ def make_r4(n: int, prefix: str) -> OnlineHadamard | None:
 
 
 def make_ro(n: int) -> OnlineHadamard | None:
-    """The recurrent-mixer out_proj-input Hadamard for LINQ_WA_ROT, or None when off."""
+    """The recurrent-mixer out_proj-input Hadamard for LinqConfig.wa_rot, or None when off."""
     if not wa_rot("ro"):
         return None
     _no_tp()

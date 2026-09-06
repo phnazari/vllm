@@ -1038,7 +1038,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 )
 
                 # the fp state the quantizer is about to see -- the HF fake-quant path's
-                # comparison point (LINQ_DUMP_STATE=<dir>); no-op when unset
+                # comparison point (linq.dump_state_dir); no-op when unset
                 linq_dump_handoff_state(self, varlen_states)
 
                 if linq_bits():

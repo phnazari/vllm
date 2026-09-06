@@ -235,14 +235,14 @@ def linq_kda_decode_vllm(mixer, q, k, v, g, beta, cu_seqlens, state_indices, seq
 # that produced the accuracy campaign? The two stacks cannot agree bitwise (different chunk
 # scan, different attention backend), so the comparison is made on the fp state handed from
 # prefill to decode -- the exact tensor both quantizers consume. Dumped only when
-# LINQ_DUMP_STATE names a directory, and only for the FIRST prefill of each layer (later
+# LinqConfig.dump_state_dir names a directory, and only for the FIRST prefill of each layer (later
 # prefills in a served run would overwrite with a different sequence's state).
 _DUMPED: set[str] = set()
 
 
 @torch.no_grad()
 def linq_dump_handoff_state(mixer, varlen_states) -> None:
-    """Persist ``varlen_states`` (fp [n, H, D, N]) for ``mixer`` to $LINQ_DUMP_STATE."""
+    """Persist ``varlen_states`` (fp [n, H, D, N]) for ``mixer`` to ``linq.dump_state_dir``."""
     d = linq_config().dump_state_dir
     if not d:
         return
