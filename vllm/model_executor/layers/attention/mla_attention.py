@@ -2219,8 +2219,8 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             # since the NVFP4 linear layer quantizes internally.
             if (
                 use_fp8_prefill or _kv_b_proj_w_dtype != current_platform.fp8_dtype()
-            ) and _kv_b_proj_w_dtype != torch.uint8:
-                kv_c_normed = kv_c_normed.to(_kv_b_proj_w_dtype)  # LINQ: packed (W8/W4) kv_b_proj has no .weight
+            ) and _kv_b_proj_w_dtype.is_floating_point:  # LINQ: never cast to a packed/int8 weight dtype (W8A8 int8,
+                kv_c_normed = kv_c_normed.to(_kv_b_proj_w_dtype)  # NVFP4 uint8): the quantized linear quantizes its input itself
 
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
@@ -2380,7 +2380,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             )
             if (
                 use_fp8_prefill or kv_b_proj_w_dtype != current_platform.fp8_dtype()
-            ) and kv_b_proj_w_dtype != torch.uint8:
+            ) and kv_b_proj_w_dtype.is_floating_point:  # LINQ: see _compute_prefill_context
                 kv_c_normed = kv_c_normed.to(kv_b_proj_w_dtype)
 
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
