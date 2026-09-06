@@ -87,8 +87,21 @@ def linq_pack_slots(mixer, state_indices, states):
     if pools is None:  # profiling-phase dummy cache
         return
     codes, scales = pools
-    pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales, state_indices, linq_config().state_bits,
-                        asym=linq_config().state_asym, sr_seed=next(_PACK_SEED) if linq_config().state_sr else None)
+    cfg = linq_config()
+    if cfg.state_axis == "key":  # KDA only: one scale per key channel over all value rows (torch path, once per prompt)
+        from linquant.kernels.state_int.kda_key_axis import pack_key_axis_to_slots
+
+        _assert_kda(mixer)
+        pack_key_axis_to_slots(states, codes, scales, state_indices, asym=cfg.state_asym,
+                               sr_seed=next(_PACK_SEED) if cfg.state_sr else None)
+        return
+    pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales, state_indices, cfg.state_bits,
+                        asym=cfg.state_asym, sr_seed=next(_PACK_SEED) if cfg.state_sr else None)
+
+
+def _assert_kda(mixer) -> None:
+    assert "Kimi" in type(mixer).__name__ or "KDA" in type(mixer).__name__, (
+        f"linq.state_axis='key' is implemented for the KDA (Kimi-Linear) mixer only, got {type(mixer).__name__}")
 
 
 @torch.no_grad()
@@ -141,6 +154,11 @@ def linq_unpack_slots(mixer, state_indices, out):
     from linquant.kernels.state_int.pack_state_kernel import unpack_state_from_slots
 
     codes, scales = _pools(mixer)
+    if linq_config().state_axis == "key":
+        from linquant.kernels.state_int.kda_key_axis import unpack_key_axis_from_slots
+
+        _assert_kda(mixer)
+        return unpack_key_axis_from_slots(out, codes, scales, state_indices, asym=linq_config().state_asym)
     return unpack_state_from_slots(out, codes, scales, state_indices, linq_config().state_bits, asym=linq_config().state_asym)
 
 
@@ -226,7 +244,7 @@ def linq_kda_decode_vllm(mixer, q, k, v, g, beta, cu_seqlens, state_indices, seq
         cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True,
         sr_seed=seq_lens if linq_config().state_sr else None,  # unsliced persistent buffer, see linq_decode
         sr_salt=_layer_salt(mixer) if linq_config().state_sr else 0,
-        asym=linq_config().state_asym, fast=linq_config().state_fast,
+        asym=linq_config().state_asym, fast=linq_config().state_fast, axis=linq_config().state_axis,
     )
 
 

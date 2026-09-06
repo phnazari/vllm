@@ -30,6 +30,7 @@ class LinqConfig:
     dump_state_dir: str | None = None  # parity probe: dump the first prefill handoff state per layer
     rot: frozenset = frozenset()  # LINQ-ROT (Mamba-2): state-side rotations, subset of {rk, rv} ("both" = rk,rv)
     norm_fused: bool = False  # LINQ-ROT: route the gated norm through the fused unrotate kernel, rotated or not
+    state_axis: str = "value"  # scale grouping: "value" = per value row over all keys; "key" = per key channel (KDA only)
 
     def __post_init__(self):
         if self.state_bits not in (0, 4, 6, 8):
@@ -38,6 +39,10 @@ class LinqConfig:
             raise ValueError("linq.state_asym needs state_bits == 8")
         if (self.state_sr or self.state_asym or self.state_fast) and not self.state_bits:
             raise ValueError("linq.state_sr / state_asym / state_fast need state_bits > 0")
+        if self.state_axis not in ("value", "key"):
+            raise ValueError(f"linq.state_axis={self.state_axis!r}: want 'value' or 'key'")
+        if self.state_axis == "key" and self.state_bits != 8:
+            raise ValueError("linq.state_axis='key' needs state_bits == 8 (the KDA vLLM-kernel copy)")
         bad = set(self.wa_rot) - _ROT_KEYS
         if bad:
             raise ValueError(f"linq.wa_rot: unknown rotations {sorted(bad)}; allowed {sorted(_ROT_KEYS)}")
@@ -80,7 +85,8 @@ class LinqConfig:
         if not self.state_bits:
             return "LINQ-STATE: off" + rot
         return (f"LINQ-STATE: int{self.state_bits} state, {'asymmetric' if self.state_asym else 'symmetric'} grid, "
-                f"stochastic rounding {'ON' if self.state_sr else 'OFF'}, {'fast' if self.state_fast else 'exact'} codec" + rot)
+                f"stochastic rounding {'ON' if self.state_sr else 'OFF'}, {'fast' if self.state_fast else 'exact'} codec"
+                + (", key-axis scales" if self.state_axis == "key" else "") + rot)
 
 
 def _rot_set(rot) -> frozenset:

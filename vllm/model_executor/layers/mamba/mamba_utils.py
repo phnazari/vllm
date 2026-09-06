@@ -304,9 +304,13 @@ class MambaStateShapeCalculator:
         bits = linq_bits()
         if bits:
             assert bits == 8, "KDA int state: the vLLM-kernel copy is int8 only"
+            from vllm.model_executor.layers.mamba.linq_state_int import linq_config
+
             heads = divide(num_heads, tp_world_size)
-            scales_shape = (heads, head_dim, 2) if linq_asym() else (heads, head_dim)
-            return (conv_state_shape, (heads, head_dim, head_dim), scales_shape)
+            # scales: one per value row (V = head_dim) or, key axis, one per key channel (K = head_k_dim)
+            rows = head_k_dim if linq_config().state_axis == "key" else head_dim
+            scales_shape = (heads, rows, 2) if linq_asym() else (heads, rows)
+            return (conv_state_shape, (heads, head_dim, head_k_dim), scales_shape)
         return (conv_state_shape, recurrent_state_shape)
 
 
