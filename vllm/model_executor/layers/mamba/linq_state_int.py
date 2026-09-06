@@ -61,35 +61,41 @@ _TUNED_VLLM = {
 }
 
 
-def _pin_launch(mod, bits, batch):
-    """Pin the int kernel's launch config; nearest measured batch at or below `batch`."""
+def _ssu_launch(bits, batch):
+    """(block_m, num_warps) for the int kernel: nearest measured batch at or below `batch`; (None, None) = its own table."""
     for b in (128, 64, 32, 16, 8, 4, 2, 1):
         if b <= batch and (bits, b) in _TUNED_VLLM:
-            mod.BLOCK_SIZE_M_OVERRIDE, mod.NUM_WARPS_OVERRIDE = _TUNED_VLLM[(bits, b)]
-            return
+            return _TUNED_VLLM[(bits, b)]
+    return None, None
+
+
+def linq_scratch(mixer, n, tail, device):
+    """Prefill-only fp32 state buffer ``[n, *tail]``, grown on demand and cached on the mixer -- never part of the page."""
+    buf = getattr(mixer, "_linq_scratch_buf", None)
+    if buf is None or buf.shape[0] < n:
+        buf = torch.empty((n, *tail), dtype=torch.float32, device=device)
+        mixer._linq_scratch_buf = buf
+    return buf[:n]
 
 
 @torch.no_grad()
 def linq_pack_slots(mixer, state_indices, states):
-    """Pack ``states`` (fp [n, H, D, N]) into the slots ``state_indices`` (prefill handoff)."""
+    """Pack ``states`` (fp [n, H, D, N]; GDN/KDA [n, HV, V, K]) into the slots ``state_indices`` (prefill handoff)."""
     from linquant.kernels.state_int.pack_state_kernel import pack_state_to_slots
 
     pools = _pools(mixer)
     if pools is None:  # profiling-phase dummy cache
         return
     codes, scales = pools
-    pack_state_to_slots(states.contiguous(), codes, scales, state_indices, linq_config().state_bits, asym=linq_config().state_asym,
-                        sr_seed=next(_PACK_SEED) if linq_config().state_sr else None)
+    pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales, state_indices, linq_config().state_bits,
+                        asym=linq_config().state_asym, sr_seed=next(_PACK_SEED) if linq_config().state_sr else None)
 
 
 @torch.no_grad()
 def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
                 state_indices_out, out, num_accepted_tokens, cu_seqlens, seq_lens=None):
     """Int-state decode step; mirrors the ``selective_state_update`` call it replaces."""
-    import importlib
-
-    ssu = importlib.import_module("linquant.kernels.state_int.selective_state_update_int")
-    selective_state_update_int = ssu.selective_state_update_int
+    from linquant.kernels.state_int.selective_state_update_int import selective_state_update_int
 
     # Phase 1 scope: no spec decode, no mamba prefix caching (src slot object == dst slot
     # object holds exactly in that regime; identity check only — no sync under graph capture).
@@ -105,7 +111,7 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
-    _pin_launch(ssu, linq_config().state_bits, x.shape[0])
+    block_m, num_warps = _ssu_launch(linq_config().state_bits, x.shape[0])
     selective_state_update_int(
         codes,
         scales,
@@ -124,6 +130,8 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
         sr_seed=seq_lens if linq_config().state_sr else None,  # unsliced: a per-call view costs ~4 us of host time per layer
         asym=linq_config().state_asym,
         sr_salt=_layer_salt(mixer) if linq_config().state_sr else 0,
+        block_m=block_m,
+        num_warps=num_warps,
     )
 
 
@@ -138,19 +146,6 @@ def linq_unpack_slots(mixer, state_indices, out):
 
 # Gated DeltaNet (qwen3_next / qwen3_5): value-grouped int state in vLLM's own value-major
 # [slots, HV, V, K] layout, so pack_state's per-row grouping is already the right axis.
-
-
-@torch.no_grad()
-def linq_pack_slots_gdn(mixer, state_indices, states):
-    """Pack ``states`` (fp [n, HV, V, K]) into the slots ``state_indices`` (prefill handoff)."""
-    from linquant.kernels.state_int.pack_state_kernel import pack_state_to_slots
-
-    pools = _pools(mixer)
-    if pools is None:  # profiling-phase dummy cache
-        return
-    codes, scales = pools
-    pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales,
-                        state_indices, linq_config().state_bits, asym=linq_config().state_asym, sr_seed=next(_PACK_SEED) if linq_config().state_sr else None)
 
 
 # (BV, warps, stages) per (bits, batch). bits 8 = the copy of vLLM's packed decode kernel, tuned on

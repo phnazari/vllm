@@ -24,6 +24,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.linq_state_int import (  # LINQ-STATE
     linq_bits,
+    linq_scratch,
     linq_unpack_slots,
 )
 from vllm.model_executor.layers.mamba.ops.unrotate_norm_gated import (  # LINQ-ROT
@@ -575,15 +576,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # Check if running on Blackwell (SM100+) for kernel tuning
         self.is_blackwell = current_platform.is_device_capability_family(100)
 
-    def _linq_scratch(self, n, dtype, device):
-        """Prefill-only fp state buffer: sized to the batch, never part of the page."""
-        shape = (n, self.num_heads // self.tp_size, self.head_dim, self.ssm_state_size)
-        buf = getattr(self, "_linq_scratch_buf", None)
-        if buf is None or buf.shape[0] < n or buf.dtype != dtype:
-            buf = torch.empty(shape, dtype=dtype, device=device)
-            self._linq_scratch_buf = buf
-        return buf[:n]
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -911,8 +903,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         1, block_idx_last_computed_token_p.unsqueeze(1)
                     ).squeeze(1)
                 if linq_bits():  # LINQ-STATE: dequantize the slots we continue from
-                    scratch = self._linq_scratch(
-                        kernel_ssm_indices.shape[0], torch.float32, hidden_states_p.device)
+                    scratch = linq_scratch(
+                        self, kernel_ssm_indices.shape[0],
+                        (self.num_heads // self.tp_size, self.head_dim, self.ssm_state_size),
+                        hidden_states_p.device)
                     linq_unpack_slots(self, kernel_ssm_indices, scratch)
                     initial_states = torch.where(
                         has_initial_states_p[:, None, None, None], scratch, 0)

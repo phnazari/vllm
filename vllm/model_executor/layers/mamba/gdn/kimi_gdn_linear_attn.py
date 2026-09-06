@@ -233,15 +233,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-    def _linq_scratch(self, n, device):
-        """Prefill-only fp32 state buffer, sized to the batch -- never part of the page (LINQ-STATE)."""
-        heads = self.local_num_heads
-        buf = getattr(self, "_linq_scratch_buf", None)
-        if buf is None or buf.shape[0] < n:
-            buf = torch.empty((n, heads, self.head_dim, self.head_dim), dtype=torch.float32, device=device)
-            self._linq_scratch_buf = buf
-        return buf[:n]
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -316,7 +307,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # LINQ-STATE: (conv, codes, scales) under the int state; the fp state is prefill scratch
         from vllm.model_executor.layers.mamba.linq_state_int import (
-            linq_bits, linq_kda_decode_vllm, linq_pack_slots_gdn, linq_unpack_slots)
+            linq_bits, linq_kda_decode_vllm, linq_pack_slots, linq_scratch, linq_unpack_slots)
 
         conv_state = constant_caches[0]
         recurrent_state = None if linq_bits() else constant_caches[1]
@@ -416,7 +407,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             if linq_bits():  # LINQ-STATE: dequantize the slots we continue from into scratch
                 initial_state = linq_unpack_slots(
                     self, non_spec_state_indices_tensor,
-                    self._linq_scratch(non_spec_state_indices_tensor.shape[0], q.device))
+                    linq_scratch(self, non_spec_state_indices_tensor.shape[0],
+                                 (self.local_num_heads, self.head_dim, self.head_dim), q.device))
                 initial_state[~has_initial_state, ...] = 0
             else:
                 zero_idx = non_spec_state_indices_tensor[~has_initial_state]
@@ -440,7 +432,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             # Init cache
             if linq_bits():  # LINQ-STATE: prefill->decode handoff, pack once per sequence
-                linq_pack_slots_gdn(self, non_spec_state_indices_tensor, last_recurrent_state)
+                linq_pack_slots(self, non_spec_state_indices_tensor, last_recurrent_state)
             else:
                 recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
         else:

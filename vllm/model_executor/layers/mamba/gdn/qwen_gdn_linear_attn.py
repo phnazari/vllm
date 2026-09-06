@@ -31,7 +31,8 @@ from vllm.model_executor.layers.mamba.linq_state_int import (
     linq_bits,
     linq_gdn_decode_packed_vllm,
     linq_gdn_decode_vllm,
-    linq_pack_slots_gdn,
+    linq_pack_slots,
+    linq_scratch,
     linq_unpack_slots,
 )
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
@@ -746,16 +747,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         return mixed_qkv_out, z_out, b_out, a_out
-
-    def _linq_scratch(self, n, device):
-        """Prefill-only fp state buffer, sized to the batch -- never part of the page."""
-        hv = self.num_v_heads // self.tp_size
-        buf = getattr(self, "_linq_scratch_buf", None)
-        if buf is None or buf.shape[0] < n:
-            buf = torch.empty((n, hv, self.head_v_dim, self.head_k_dim),
-                              dtype=torch.float32, device=device)
-            self._linq_scratch_buf = buf
-        return buf[:n]
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
@@ -1481,7 +1472,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if linq_bits():  # LINQ-STATE: dequantize the slots we continue from
                 initial_state = linq_unpack_slots(
                     self, prefill_state_indices,
-                    self._linq_scratch(prefill_state_indices.shape[0], query_non_spec.device))
+                    linq_scratch(self, prefill_state_indices.shape[0],
+                                 (self.num_v_heads // self.tp_size, self.head_v_dim, self.head_k_dim),
+                                 query_non_spec.device))
             else:
                 initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
@@ -1503,7 +1496,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             # Init cache
             if linq_bits():  # LINQ-STATE: prefill->decode handoff, pack once per sequence
-                linq_pack_slots_gdn(self, prefill_state_indices, last_recurrent_state)
+                linq_pack_slots(self, prefill_state_indices, last_recurrent_state)
             else:
                 ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
 
