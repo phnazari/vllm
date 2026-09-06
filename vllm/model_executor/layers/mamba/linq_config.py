@@ -6,17 +6,14 @@
 #   LLM(model, additional_config={"linq": {"state_bits": 8, "state_sr": True, "wa_rot": "r4,ro"}})
 #
 # ``VllmConfig.additional_config`` is hashed into the compile-cache key (vllm/config/vllm.py), reaches
-# every worker process and is printed with the engine config -- none of which held for the LINQ_*
-# environment variables this replaces. The env vars are read only as a deprecated fallback when
-# ``additional_config`` carries no ``linq`` key (cleanup proposal 2026-09-04, §B).
+# every worker process and is printed with the engine config. ``wa_rot`` defaults to the checkpoint's
+# own declaration (``linq_wa_rot`` in the export's config.json): a W/A export is only correct with its
+# online rotations on, so the export says which; ``additional_config`` still overrides it.
 """``LinqConfig``: frozen, validated, resolved once per process."""
 
-import os
-import warnings
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 
 _ROT_KEYS = frozenset({"r4", "r4s", "ro"})
-_ENV_KEYS = ("LINQ_STATE_BITS", "LINQ_STATE_SR", "LINQ_STATE_ASYM", "LINQ_STATE_FAST", "LINQ_WA_ROT", "LINQ_DUMP_STATE")
 
 
 @dataclass(frozen=True)
@@ -51,38 +48,23 @@ class LinqConfig:
         unknown = set(d) - names
         if unknown:
             raise ValueError(f"additional_config.linq: unknown keys {sorted(unknown)}; known {sorted(names)}")
-        rot = d.get("wa_rot", ())
-        if isinstance(rot, str):
-            rot = [r for r in rot.lower().replace(" ", "").split(",") if r]
-        d["wa_rot"] = frozenset(rot)
+        d["wa_rot"] = _rot_set(d.get("wa_rot", ()))
         if "state_bits" in d:
             d["state_bits"] = int(d["state_bits"])
         return cls(**d)
 
     @classmethod
-    def from_env(cls) -> "LinqConfig":
-        """Deprecated fallback: the LINQ_* environment variables (same semantics as before 2026-09-05)."""
-        bits = int(os.environ.get("LINQ_STATE_BITS", "0") or 0)
-        rot = os.environ.get("LINQ_WA_ROT", "")
-        return cls(
-            state_bits=bits,
-            state_sr=bits > 0 and os.environ.get("LINQ_STATE_SR") == "1",
-            state_asym=bits > 0 and os.environ.get("LINQ_STATE_ASYM") == "1",
-            state_fast=bits > 0 and os.environ.get("LINQ_STATE_FAST") == "1",
-            wa_rot=frozenset(r for r in rot.lower().replace(" ", "").split(",") if r),
-            dump_state_dir=os.environ.get("LINQ_DUMP_STATE") or None,
-        )
-
-    @classmethod
     def from_vllm_config(cls, vllm_config) -> "LinqConfig":
-        """``additional_config["linq"]`` when present, else the env fallback (with a one-time warning if any LINQ_* is set)."""
+        """``additional_config["linq"]`` (default: all off); ``wa_rot`` falls back to the checkpoint's ``linq_wa_rot``."""
         raw = getattr(vllm_config, "additional_config", None) if vllm_config is not None else None
-        if isinstance(raw, dict) and "linq" in raw:
-            return cls.from_dict(raw["linq"] or {})
-        if any(os.environ.get(k) for k in _ENV_KEYS):
-            warnings.warn("LINQ: configuring through LINQ_* environment variables is deprecated; pass "
-                          "--additional-config '{\"linq\": {...}}' instead", stacklevel=2)
-        return cls.from_env()
+        linq = (raw.get("linq") or {}) if isinstance(raw, dict) else {}
+        cfg = cls.from_dict(linq)
+        if "wa_rot" not in linq:  # an explicit wa_rot (even empty: the negative-control arm) always wins
+            hf = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+            stamped = getattr(hf, "linq_wa_rot", None)
+            if stamped:
+                cfg = replace(cfg, wa_rot=_rot_set(stamped))
+        return cfg
 
     def banner(self) -> str:
         """The one-line description the runners grep for (``LINQ-STATE: ...``)."""
@@ -91,6 +73,13 @@ class LinqConfig:
             return "LINQ-STATE: off" + rot
         return (f"LINQ-STATE: int{self.state_bits} state, {'asymmetric' if self.state_asym else 'symmetric'} grid, "
                 f"stochastic rounding {'ON' if self.state_sr else 'OFF'}, {'fast' if self.state_fast else 'exact'} codec" + rot)
+
+
+def _rot_set(rot) -> frozenset:
+    """'r4, ro' | ['r4', 'ro'] -> frozenset({'r4', 'ro'})."""
+    if isinstance(rot, str):
+        rot = [r for r in rot.lower().replace(" ", "").split(",") if r]
+    return frozenset(rot)
 
 
 # --- process-wide resolved config ------------------------------------------------------------
@@ -113,8 +102,7 @@ def set_current(vllm_config) -> LinqConfig:
 
 
 def current() -> LinqConfig:
-    """The pinned config; else the active ``VllmConfig`` context (model construction); else the env fallback."""
-    global _RESOLVED
+    """The pinned config; else the active ``VllmConfig`` context (model construction); else all off."""
     if _RESOLVED is None:
         try:
             from vllm.config import get_current_vllm_config_or_none
@@ -122,8 +110,7 @@ def current() -> LinqConfig:
             vc = get_current_vllm_config_or_none()
         except Exception:  # noqa: BLE001 - outside an engine (tests, HF harness)
             vc = None
-        cfg = LinqConfig.from_vllm_config(vc)
         if vc is not None:
             return set_current(vc)
-        return cfg  # env fallback, not pinned: a later set_current(vllm_config) wins
+        return LinqConfig()  # not pinned: a later set_current(vllm_config) wins
     return _RESOLVED
