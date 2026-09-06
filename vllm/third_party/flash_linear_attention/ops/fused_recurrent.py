@@ -8,7 +8,6 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-import os
 from contextlib import contextmanager
 
 import torch
@@ -339,19 +338,20 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
-# LINQ-STATE: (BV, warps, stages) per batch, swept with the same cold-L2 recipe as our int
-# kernels (scripts/investigate/vllm_qwen_launch_tune.py, Qwen3.5-9B, H100, 2026-08-21).
-def _linq_load_fp_cfg():
-    """(BV, warps, stages) per batch for the fp baseline, from the tuner's JSON."""
-    path = os.environ.get("LINQ_GDN_TUNED_JSON")
-    if os.environ.get("LINQ_GDN_TUNED_FP") != "1" or not path or not os.path.exists(path):
-        return {}
-    import json
-
-    return {int(b): tuple(c) for b, c in json.load(open(path)).get("fp", {}).items()}
-
-
-_LINQ_TUNED_FP = _linq_load_fp_cfg()
+# LINQ-STATE: (BV, warps, stages) per batch for this fp32 baseline kernel (vLLM hardcodes 32/1/3),
+# swept with the same cold-L2 recipe as our int kernels: scripts/investigate/vllm_qwen_launch_tune.py
+# --arms fp, Qwen3.5-9B shapes (HV=32, K=V=128), H100 SXM, 2026-09-04. Baked; re-run the tuner and
+# paste its "fp" table here to re-bake.
+_LINQ_TUNED_FP = {
+    1: (128, 4, 2),
+    2: (8, 8, 3),
+    4: (8, 1, 3),
+    8: (8, 1, 1),
+    16: (8, 1, 2),
+    32: (8, 1, 2),
+    64: (8, 1, 1),
+    128: (32, 8, 1),
+}
 
 _linq_gdn_cfg: tuple[int, int, int] | None = None
 

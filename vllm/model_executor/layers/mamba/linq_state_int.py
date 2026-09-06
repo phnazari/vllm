@@ -5,8 +5,8 @@
 # sequence's final state is packed once into side pools (uint8 codes + fp32 per-row scales,
 # lazily allocated to the same slot count); DECODE then runs int-in-place via
 # ``linquant.kernels.state_int.selective_state_update_int`` and never touches the fp pool.
-# Enabled by ``LINQ_STATE_BITS`` in {4, 6, 8}; requires ``linquant`` (and its fla dep) on
-# PYTHONPATH. Scale grouping: one fp32 scale per (head, dim) row spanning dstate == 128
+# Enabled by ``additional_config['linq']['state_bits']`` in {4, 6, 8} (LinqConfig); requires
+# ``linquant`` (and its fla dep) on PYTHONPATH. Scale grouping: one fp32 scale per (head, dim) row spanning dstate == 128
 # (``pack_state`` numerics — the accuracy campaign's ``int{n}_block`` mode for nemotronh).
 
 import os
@@ -153,28 +153,15 @@ def linq_pack_slots_gdn(mixer, state_indices, states):
                         state_indices, linq_config().state_bits, asym=linq_config().state_asym, sr_seed=next(_PACK_SEED) if linq_config().state_sr else None)
 
 
-# (BV, warps, stages) per (bits, batch), same recipe as the fp arm above.
+# (BV, warps, stages) per (bits, batch). bits 8 = the copy of vLLM's packed decode kernel, tuned on
+# H100 SXM 2026-09-04 with scripts/investigate/vllm_qwen_launch_tune.py --arms packed_int8
+# (was qwen_gdn_decode_vllmk.json); bits 4 = the fla-derived vf kernel, same cold-L2 recipe as the fp arm.
 _TUNED_GDN = {
-    (8, 1): (16, 4, 2), (8, 2): (8, 1, 3), (8, 4): (8, 1, 3), (8, 8): (8, 1, 2),
-    (8, 16): (8, 1, 3), (8, 32): (8, 1, 3), (8, 64): (8, 1, 2), (8, 128): (8, 1, 1),
+    (8, 1): (128, 2, 2), (8, 2): (8, 1, 3), (8, 4): (16, 1, 1), (8, 8): (16, 1, 3),
+    (8, 16): (16, 1, 2), (8, 32): (16, 1, 1), (8, 64): (16, 1, 2), (8, 128): (16, 1, 1),
     (4, 1): (8, 1, 3), (4, 2): (8, 1, 3), (4, 4): (16, 1, 3), (4, 8): (8, 1, 2),
     (4, 16): (16, 1, 2), (4, 32): (16, 1, 2), (4, 64): (16, 1, 2), (4, 128): (16, 1, 2),
 }
-
-
-def _load_tuned_gdn():
-    """Override the baked table from the tuner's JSON when LINQ_GDN_TUNED_JSON points at one."""
-    path = os.environ.get("LINQ_GDN_TUNED_JSON")
-    if not path or not os.path.exists(path):
-        return _TUNED_GDN
-    import json
-
-    raw = json.load(open(path))
-    return {(int(arm[3:]), int(b)): tuple(cfg)
-            for arm, d in raw.items() if arm.startswith("int") for b, cfg in d.items()}
-
-
-_TUNED_GDN = _load_tuned_gdn() if os.environ.get("LINQ_GDN_TUNED_JSON") else _TUNED_GDN
 
 
 def _launch_or_none(t):
@@ -225,7 +212,7 @@ def linq_gdn_decode_packed_vllm(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, s
         mixed_qkv, a, b, A_log, dt_bias, scale, codes, scales, out, state_indices, use_qk_l2norm_in_kernel=True,
         sr_seed=seq_lens if linq_config().state_sr else None, sr_salt=_layer_salt(mixer) if linq_config().state_sr else 0,
         asym=linq_config().state_asym, fast=linq_config().state_fast,
-        launch=_launch_or_none(_gdn_launch(linq_config().state_bits, mixed_qkv.shape[0])),  # tuned (BV, warps, stages) for the copy (qwen_gdn_decode_vllmk.json via LINQ_GDN_TUNED_JSON); vLLM's stock launch when untuned
+        launch=_launch_or_none(_gdn_launch(linq_config().state_bits, mixed_qkv.shape[0])),  # baked (BV, warps, stages) for the copy; vLLM's stock launch when untuned
     )
 
 
