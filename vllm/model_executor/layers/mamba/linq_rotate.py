@@ -3,27 +3,19 @@
 #
 # R_k rotates the d_state axis of B and C by the same R, so it cancels in y = S C.
 # R_v rotates the head_dim axis of x, so the state becomes R_v S and the output R_v y;
-# that is undone inside vLLM's own gated norm. Enable with LINQ_ROT in {rk, rv, both}.
+# that is undone inside vLLM's own gated norm. Enable with additional_config
+# {"linq": {"rot": "rk" | "rv" | "both", "norm_fused": true}} (LinqConfig).
 
 import math
-import os
 
 import torch
 
-_ROT = {
-    r
-    for r in os.environ.get("LINQ_ROT", "").lower().replace("both", "rk,rv").split(",")
-    if r
-}
+from vllm.model_executor.layers.mamba.linq_config import current as linq_config
 
 
 def linq_rot(kind: str) -> bool:
     """True when rotation `kind` ('rk' / 'rv') is enabled."""
-    if _ROT - {"rk", "rv"}:
-        raise ValueError(
-            f"LINQ_ROT={os.environ.get('LINQ_ROT')} unsupported (want rk, rv, both)"
-        )
-    return kind in _ROT
+    return kind in linq_config().rot
 
 
 def linq_norm_fused() -> bool:
@@ -32,18 +24,17 @@ def linq_norm_fused() -> bool:
     Both arms then run the SAME kernel and differ only by the ROTATE constexpr, so a
     rotation measurement is not confounded by also swapping the norm implementation.
     """
-    return os.environ.get("LINQ_NORM_FUSED", "") not in ("", "0")
+    return linq_config().norm_fused
 
 
 def linq_rot_any() -> bool:
     """True when any rotation is enabled."""
-    return bool(_ROT)
+    return bool(linq_config().rot)
 
 
 def factor(head_dim: int, device):
-    """Sign vector for R = diag(signs) @ H_d / sqrt(d), seeded by LINQ_ROT_SEED."""
-    seed = int(os.environ.get("LINQ_ROT_SEED", "0")) + head_dim
-    g = torch.Generator(device="cpu").manual_seed(seed)
+    """Sign vector for R = diag(signs) @ H_d / sqrt(d), seeded by head_dim."""
+    g = torch.Generator(device="cpu").manual_seed(head_dim)
     # device="cpu" is explicit: vLLM sets a cuda default device during init, and a cpu
     # generator against a cuda default device raises
     bits = torch.randint(0, 2, (head_dim,), generator=g, dtype=torch.int8, device="cpu")

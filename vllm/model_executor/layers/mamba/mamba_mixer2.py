@@ -100,6 +100,7 @@ class Mixer2RMSNormGated(CustomOp):
         self.full_hidden_size = full_hidden_size
         rmat = linq_norm_matrix(head_dim)  # LINQ-ROT
         self._linq_unrot = rmat is not None
+        self._linq_norm_fused = linq_norm_fused()  # LINQ-ROT: resolved once, the forward is compiled
         self._linq_head_dim = head_dim or 1
         if rmat is not None:  # buffers, so the module move puts them on the GPU at load
             self.register_buffer("_linq_rmat", rmat, persistent=False)
@@ -136,7 +137,7 @@ class Mixer2RMSNormGated(CustomOp):
         #   3. The general case can be pretty complicated so we AllGather
         #      the input and then redundantly compute the RMSNorm.
         input_dtype = x.dtype
-        if linq_norm_fused() and self.use_rms_norm and self.tp_size == 1:
+        if self._linq_norm_fused and self.use_rms_norm and self.tp_size == 1:
             return unrotate_rmsnorm_gated(  # LINQ-ROT: same kernel with and without R_v
                 x,
                 gate,

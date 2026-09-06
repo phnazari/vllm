@@ -9,11 +9,13 @@
 # every worker process and is printed with the engine config. ``wa_rot`` defaults to the checkpoint's
 # own declaration (``linq_wa_rot`` in the export's config.json): a W/A export is only correct with its
 # online rotations on, so the export says which; ``additional_config`` still overrides it.
+# ``rot`` / ``norm_fused`` are the LINQ-ROT (Mamba-2 R_k / R_v) experiment knobs (tab:vllm-rotation).
 """``LinqConfig``: frozen, validated, resolved once per process."""
 
 from dataclasses import dataclass, fields, replace
 
 _ROT_KEYS = frozenset({"r4", "r4s", "ro"})
+_STATE_ROT_KEYS = frozenset({"rk", "rv"})
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,8 @@ class LinqConfig:
     state_fast: bool = False  # reciprocal-multiply codecs; False = exact division = every locked recipe
     wa_rot: frozenset = frozenset()  # online rotations of the W/A exports: subset of {r4 | r4s, ro}
     dump_state_dir: str | None = None  # parity probe: dump the first prefill handoff state per layer
+    rot: frozenset = frozenset()  # LINQ-ROT (Mamba-2): state-side rotations, subset of {rk, rv} ("both" = rk,rv)
+    norm_fused: bool = False  # LINQ-ROT: route the gated norm through the fused unrotate kernel, rotated or not
 
     def __post_init__(self):
         if self.state_bits not in (0, 4, 6, 8):
@@ -39,6 +43,9 @@ class LinqConfig:
             raise ValueError(f"linq.wa_rot: unknown rotations {sorted(bad)}; allowed {sorted(_ROT_KEYS)}")
         if {"r4", "r4s"} <= set(self.wa_rot):
             raise ValueError("linq.wa_rot: r4 and r4s are exclusive")
+        bad = set(self.rot) - _STATE_ROT_KEYS
+        if bad:
+            raise ValueError(f"linq.rot: unknown rotations {sorted(bad)}; allowed {sorted(_STATE_ROT_KEYS)} or both")
 
     @classmethod
     def from_dict(cls, d: dict) -> "LinqConfig":
@@ -49,6 +56,7 @@ class LinqConfig:
         if unknown:
             raise ValueError(f"additional_config.linq: unknown keys {sorted(unknown)}; known {sorted(names)}")
         d["wa_rot"] = _rot_set(d.get("wa_rot", ()))
+        d["rot"] = _rot_set(d.get("rot", ())) - {"both"} | ({"rk", "rv"} if "both" in _rot_set(d.get("rot", ())) else set())
         if "state_bits" in d:
             d["state_bits"] = int(d["state_bits"])
         return cls(**d)
