@@ -381,7 +381,19 @@ class FusedMoEQuantConfig:
 
     @property
     def use_int8_w8a8(self) -> bool:
-        return self.quant_dtype == torch.int8
+        return self.quant_dtype == torch.int8 and self._w1.dtype != "int4"
+
+    @property
+    def use_int4_w4a8(self) -> bool:
+        """LINQ: dynamic per-token int8 activations into int4 group-scaled experts."""
+        return self.quant_dtype == torch.int8 and self._w1.dtype == "int4"
+
+    @property
+    def w4a8_block_shape(self) -> list[int]:
+        """The weight group as the fused_experts block_shape ([0, group]); the activations
+        are per token, so `block_shape` itself is None."""
+        assert self.use_int4_w4a8 and self._w1.shape is not None
+        return [0, self._w1.shape.col]
 
     @property
     def use_int8_w8a16(self) -> bool:
@@ -874,6 +886,24 @@ def nvfp4_w4a16_moe_quant_config(
         g2_alphas=g2_alphas,
         weight_dtype="nvfp4",
         gemm1_clamp_limit=gemm1_clamp_limit,
+    )
+
+
+def int4_w4a8_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    group_size: int,
+) -> FusedMoEQuantConfig:
+    """
+    LINQ: dynamic per-token int8 activations and int4 group-scaled weights (the
+    llm-compressor W4A8 scheme on MoE experts), served by the Triton wna16 kernel's
+    int4_w4a8 branch.
+    """
+    return FusedMoEQuantConfig(
+        _a1=FusedMoEQuantDesc(torch.int8, GroupShape.PER_TOKEN),
+        _a2=FusedMoEQuantDesc(torch.int8, GroupShape.PER_TOKEN),
+        _w1=FusedMoEQuantDesc("int4", GroupShape(1, group_size), w1_scale),
+        _w2=FusedMoEQuantDesc("int4", GroupShape(1, group_size), w2_scale),
     )
 
 
