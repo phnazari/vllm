@@ -5,7 +5,7 @@
 # sequence's final state is packed once into side pools (uint8 codes + fp32 per-row scales,
 # lazily allocated to the same slot count); DECODE then runs int-in-place via
 # ``linquant.kernels.state_int.mamba2.selective_state_update_int`` and never touches the fp pool.
-# Enabled by ``additional_config['linq']['state_bits']`` in {4, 6, 8} (LinqConfig); requires
+# Enabled by ``additional_config['linq']['state_bits'] = 8`` (LinqConfig); requires
 # ``linquant`` (and its fla dep) on PYTHONPATH. Scale grouping: one fp32 scale per (head, dim) row spanning dstate == 128
 # (``pack_state`` numerics — the accuracy campaign's ``int{n}_block`` mode for nemotronh).
 
@@ -19,7 +19,7 @@ _PACK_SEED = __import__("itertools").count(1)  # prefill handoff runs eagerly: a
 
 
 def linq_bits() -> int:
-    """0 = disabled, else 4/6/8 (validated by LinqConfig)."""
+    """0 = disabled, else 8 (validated by LinqConfig)."""
     return linq_config().state_bits
 
 
@@ -53,19 +53,14 @@ def _pools(mixer):
 
 # Launch configs for nemotron's shape, swept with the same cold-L2 recipe as vLLM's own fp
 # kernel (scripts/investigate/vllm_baseline_launch_tune.py, H100, 2026-08-21).
-_TUNED_VLLM = {
-    (8, 1): (8, 2), (8, 2): (16, 4), (8, 4): (8, 1), (8, 8): (8, 1),
-    (8, 16): (32, 2), (8, 32): (32, 2), (8, 64): (32, 2), (8, 128): (32, 2),
-    (4, 1): (32, 8), (4, 2): (32, 8), (4, 4): (32, 4), (4, 8): (32, 4),
-    (4, 16): (64, 4), (4, 32): (64, 4), (4, 64): (64, 4), (4, 128): (64, 4),
-}
+_TUNED_VLLM = {1: (8, 2), 2: (16, 4), 4: (8, 1), 8: (8, 1), 16: (32, 2), 32: (32, 2), 64: (32, 2), 128: (32, 2)}
 
 
-def _ssu_launch(bits, batch):
+def _ssu_launch(batch):
     """(block_m, num_warps) for the int kernel: nearest measured batch at or below `batch`; (None, None) = its own table."""
     for b in (128, 64, 32, 16, 8, 4, 2, 1):
-        if b <= batch and (bits, b) in _TUNED_VLLM:
-            return _TUNED_VLLM[(bits, b)]
+        if b <= batch:
+            return _TUNED_VLLM[b]
     return None, None
 
 
@@ -95,7 +90,7 @@ def linq_pack_slots(mixer, state_indices, states):
         pack_key_axis_to_slots(states, codes, scales, state_indices, asym=cfg.state_asym,
                                sr_seed=next(_PACK_SEED) if cfg.state_sr else None)
         return
-    pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales, state_indices, cfg.state_bits,
+    pack_state_to_slots(states.contiguous().to(torch.float32), codes, scales, state_indices,
                         asym=cfg.state_asym, sr_seed=next(_PACK_SEED) if cfg.state_sr else None)
 
 
@@ -124,7 +119,7 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
-    block_m, num_warps = _ssu_launch(linq_config().state_bits, x.shape[0])
+    block_m, num_warps = _ssu_launch(x.shape[0])
     selective_state_update_int(
         codes,
         scales,
@@ -137,7 +132,6 @@ def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
         dt_bias=dt_bias,
         dt_softplus=True,
         state_batch_indices=state_indices_in,
-        bits=linq_config().state_bits,
         out=out,
         null_block_id=0,  # vLLM v1 pads decode batches with the reserved null block 0
         sr_seed=seq_lens if linq_config().state_sr else None,  # unsliced: a per-call view costs ~4 us of host time per layer
@@ -159,22 +153,15 @@ def linq_unpack_slots(mixer, state_indices, out):
 
         _assert_kda(mixer)
         return unpack_key_axis_from_slots(out, codes, scales, state_indices, asym=linq_config().state_asym)
-    return unpack_state_from_slots(out, codes, scales, state_indices, linq_config().state_bits, asym=linq_config().state_asym)
+    return unpack_state_from_slots(out, codes, scales, state_indices, asym=linq_config().state_asym)
 
 
 # Gated DeltaNet (qwen3_next / qwen3_5): value-grouped int state in vLLM's own value-major
 # [slots, HV, V, K] layout, so pack_state's per-row grouping is already the right axis.
 
 
-# (BV, warps, stages) per (bits, batch). bits 8 = the copy of vLLM's packed decode kernel, tuned on
-# H100 SXM 2026-09-04 with scripts/investigate/vllm_qwen_launch_tune.py --arms packed_int8
-# (was qwen_gdn_decode_vllmk.json); bits 4 = the fla-derived vf kernel, same cold-L2 recipe as the fp arm.
-_TUNED_GDN = {
-    (8, 1): (128, 2, 2), (8, 2): (8, 1, 3), (8, 4): (16, 1, 1), (8, 8): (16, 1, 3),
-    (8, 16): (16, 1, 2), (8, 32): (16, 1, 1), (8, 64): (16, 1, 2), (8, 128): (16, 1, 1),
-    (4, 1): (8, 1, 3), (4, 2): (8, 1, 3), (4, 4): (16, 1, 3), (4, 8): (8, 1, 2),
-    (4, 16): (16, 1, 2), (4, 32): (16, 1, 2), (4, 64): (16, 1, 2), (4, 128): (16, 1, 2),
-}
+# (BV, warps, stages) per batch for the copy of vLLM's packed decode kernel, cold-L2 sweep on H100 SXM.
+_TUNED_GDN = {1: (128, 2, 2), 2: (8, 1, 3), 4: (16, 1, 1), 8: (16, 1, 3), 16: (16, 1, 2), 32: (16, 1, 1), 64: (16, 1, 2), 128: (16, 1, 1)}
 
 
 def _launch_or_none(t):
@@ -182,10 +169,10 @@ def _launch_or_none(t):
     return None if t[0] is None else t
 
 
-def _gdn_launch(bits, batch):
+def _gdn_launch(batch):
     for b in (128, 64, 32, 16, 8, 4, 2, 1):
-        if b <= batch and (bits, b) in _TUNED_GDN:
-            return _TUNED_GDN[(bits, b)]
+        if b <= batch:
+            return _TUNED_GDN[b]
     return (None, None, None)
 
 
@@ -203,7 +190,6 @@ def linq_gdn_decode_vllm(mixer, q, k, v, a, b, A_log, dt_bias, scale, cu_seqlens
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
-    assert linq_config().state_bits == 8, "the vLLM-kernel copy is int8 only"
     return fused_sigmoid_gating_delta_rule_update_int(
         A_log, a, b, dt_bias, q, k, v, codes, scales, state_indices,
         scale=scale, cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True,
@@ -220,12 +206,11 @@ def linq_gdn_decode_packed_vllm(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, s
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
-    assert linq_config().state_bits == 8, "the vLLM-kernel copy is int8 only"
     return fused_recurrent_gated_delta_rule_packed_decode_int(
         mixed_qkv, a, b, A_log, dt_bias, scale, codes, scales, out, state_indices, use_qk_l2norm_in_kernel=True,
         sr_seed=seq_lens if linq_config().state_sr else None, sr_salt=_layer_salt(mixer) if linq_config().state_sr else 0,
         asym=linq_config().state_asym, fast=linq_config().state_fast,
-        launch=_launch_or_none(_gdn_launch(linq_config().state_bits, mixed_qkv.shape[0])),  # baked (BV, warps, stages) for the copy; vLLM's stock launch when untuned
+        launch=_launch_or_none(_gdn_launch(mixed_qkv.shape[0])),  # baked (BV, warps, stages) for the copy; vLLM's stock launch when untuned
     )
 
 
@@ -238,7 +223,6 @@ def linq_kda_decode_vllm(mixer, q, k, v, g, beta, cu_seqlens, state_indices, seq
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
     codes, scales = pools
-    assert linq_config().state_bits == 8, "the vLLM-kernel copy is int8 only"
     return fused_recurrent_kda_int(
         q, k, v, g, beta, None, codes, scales, state_indices,
         cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True,

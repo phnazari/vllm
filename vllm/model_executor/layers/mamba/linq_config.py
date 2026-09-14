@@ -22,7 +22,7 @@ _STATE_ROT_KEYS = frozenset({"rk", "rv"})
 class LinqConfig:
     """Serving-time LinQuant settings (all off by default)."""
 
-    state_bits: int = 0  # 0 off | 4 | 6 | 8 (the vLLM-kernel copies for GDN / KDA are int8 only)
+    state_bits: int = 0  # 0 off | 8
     state_sr: bool = False  # stochastic rounding at the prefill handoff and in the decode requant
     state_asym: bool = False  # affine INT8 grid (scale, min) per row; requires state_bits == 8
     state_fast: bool = False  # reciprocal-multiply codecs; False = exact division = every locked recipe
@@ -33,16 +33,12 @@ class LinqConfig:
     state_axis: str = "value"  # scale grouping: "value" = per value row over all keys; "key" = per key channel (KDA only)
 
     def __post_init__(self):
-        if self.state_bits not in (0, 4, 6, 8):
-            raise ValueError(f"linq.state_bits={self.state_bits!r}: want 0, 4, 6 or 8")
-        if self.state_asym and self.state_bits != 8:
-            raise ValueError("linq.state_asym needs state_bits == 8")
-        if (self.state_sr or self.state_asym or self.state_fast) and not self.state_bits:
-            raise ValueError("linq.state_sr / state_asym / state_fast need state_bits > 0")
+        if self.state_bits not in (0, 8):
+            raise ValueError(f"linq.state_bits={self.state_bits!r}: want 0 or 8")
         if self.state_axis not in ("value", "key"):
             raise ValueError(f"linq.state_axis={self.state_axis!r}: want 'value' or 'key'")
-        if self.state_axis == "key" and self.state_bits != 8:
-            raise ValueError("linq.state_axis='key' needs state_bits == 8 (the KDA vLLM-kernel copy)")
+        if (self.state_sr or self.state_asym or self.state_fast or self.state_axis == "key") and not self.state_bits:
+            raise ValueError("linq.state_sr / state_asym / state_fast / state_axis need state_bits == 8")
         bad = set(self.wa_rot) - _ROT_KEYS
         if bad:
             raise ValueError(f"linq.wa_rot: unknown rotations {sorted(bad)}; allowed {sorted(_ROT_KEYS)}")

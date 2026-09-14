@@ -202,17 +202,14 @@ class MambaStateShapeCalculator:
         #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
 
-        # LINQ-STATE: the int arms keep ONLY codes [H, D, state*bits/8] + scales [H, D] per
-        # slot; the fp state is prefill scratch, so it never enters the page. The asymmetric
-        # grid stores (scale, min) per row: scales [H, D, 2].
+        # LINQ-STATE: the int8 arm keeps ONLY codes [H, D, state] + scales [H, D] per slot; the fp state
+        # is prefill scratch, so it never enters the page. The asymmetric grid stores (scale, min) per row.
         from vllm.model_executor.layers.mamba.linq_state_int import linq_asym, linq_bits
 
-        bits = linq_bits()
-        if bits:
-            code_w = {4: state_size // 2, 6: 3 * state_size // 4, 8: state_size}[bits]
+        if linq_bits():
             heads = divide(num_heads, tp_world_size)
             scales_shape = (heads, head_dim, 2) if linq_asym() else (heads, head_dim)
-            return (conv_state_shape, (heads, head_dim, code_w), scales_shape)
+            return (conv_state_shape, (heads, head_dim, state_size), scales_shape)
         return conv_state_shape, temporal_state_shape
 
     @classmethod
@@ -265,12 +262,10 @@ class MambaStateShapeCalculator:
         # the fp state is prefill scratch, so it never enters the page.
         from vllm.model_executor.layers.mamba.linq_state_int import linq_asym, linq_bits
 
-        bits = linq_bits()
-        if bits:
-            code_w = {4: head_k_dim // 2, 6: 3 * head_k_dim // 4, 8: head_k_dim}[bits]
+        if linq_bits():
             hv = divide(num_v_heads, tp_world_size)
             scales_shape = (hv, head_v_dim, 2) if linq_asym() else (hv, head_v_dim)
-            return (conv_state_shape, (hv, head_v_dim, code_w), scales_shape)
+            return (conv_state_shape, (hv, head_v_dim, head_k_dim), scales_shape)
         return conv_state_shape, temporal_state_shape
 
     @classmethod
@@ -301,9 +296,7 @@ class MambaStateShapeCalculator:
         # (fused_recurrent_kda indexes the pool as [.., V, K]); the fp state is prefill scratch.
         from vllm.model_executor.layers.mamba.linq_state_int import linq_asym, linq_bits
 
-        bits = linq_bits()
-        if bits:
-            assert bits == 8, "KDA int state: the vLLM-kernel copy is int8 only"
+        if linq_bits():
             from vllm.model_executor.layers.mamba.linq_state_int import linq_config
 
             heads = divide(num_heads, tp_world_size)
