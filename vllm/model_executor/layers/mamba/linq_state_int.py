@@ -4,7 +4,7 @@
 # pool stays allocated and authoritative for PREFILL; at the prefill->decode handoff each
 # sequence's final state is packed once into side pools (uint8 codes + fp32 per-row scales,
 # lazily allocated to the same slot count); DECODE then runs int-in-place via
-# ``linquant.kernels.state_int.selective_state_update_int`` and never touches the fp pool.
+# ``linquant.kernels.state_int.mamba2.selective_state_update_int`` and never touches the fp pool.
 # Enabled by ``additional_config['linq']['state_bits']`` in {4, 6, 8} (LinqConfig); requires
 # ``linquant`` (and its fla dep) on PYTHONPATH. Scale grouping: one fp32 scale per (head, dim) row spanning dstate == 128
 # (``pack_state`` numerics — the accuracy campaign's ``int{n}_block`` mode for nemotronh).
@@ -89,7 +89,7 @@ def linq_pack_slots(mixer, state_indices, states):
     codes, scales = pools
     cfg = linq_config()
     if cfg.state_axis == "key":  # KDA only: one scale per key channel over all value rows (torch path, once per prompt)
-        from linquant.kernels.state_int.kda_key_axis import pack_key_axis_to_slots
+        from linquant.kernels.state_int.kda.key_axis import pack_key_axis_to_slots
 
         _assert_kda(mixer)
         pack_key_axis_to_slots(states, codes, scales, state_indices, asym=cfg.state_asym,
@@ -108,7 +108,7 @@ def _assert_kda(mixer) -> None:
 def linq_decode(mixer, x, dt, A, B, C, D, dt_bias, state_indices_in,
                 state_indices_out, out, num_accepted_tokens, cu_seqlens, seq_lens=None):
     """Int-state decode step; mirrors the ``selective_state_update`` call it replaces."""
-    from linquant.kernels.state_int.selective_state_update_int import selective_state_update_int
+    from linquant.kernels.state_int.mamba2.selective_state_update_int import selective_state_update_int
 
     # Phase 1 scope: no spec decode, no mamba prefix caching (src slot object == dst slot
     # object holds exactly in that regime; identity check only — no sync under graph capture).
@@ -155,7 +155,7 @@ def linq_unpack_slots(mixer, state_indices, out):
 
     codes, scales = _pools(mixer)
     if linq_config().state_axis == "key":
-        from linquant.kernels.state_int.kda_key_axis import unpack_key_axis_from_slots
+        from linquant.kernels.state_int.kda.key_axis import unpack_key_axis_from_slots
 
         _assert_kda(mixer)
         return unpack_key_axis_from_slots(out, codes, scales, state_indices, asym=linq_config().state_asym)
@@ -198,7 +198,7 @@ def linq_gdn_decode_vllm(mixer, q, k, v, a, b, A_log, dt_bias, scale, cu_seqlens
     Same arguments as vLLM's ``fused_sigmoid_gating_delta_rule_update`` call at the decode
     sites (q/k/v are the rearranged ``[1, T, H, K]`` tensors); returns ``o`` shaped like it.
     """
-    from linquant.kernels.state_int.fused_sigmoid_gating_int import fused_sigmoid_gating_delta_rule_update_int
+    from linquant.kernels.state_int.gdn.fused_sigmoid_gating_int import fused_sigmoid_gating_delta_rule_update_int
 
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
@@ -215,7 +215,7 @@ def linq_gdn_decode_vllm(mixer, q, k, v, a, b, A_log, dt_bias, scale, cu_seqlens
 
 def linq_gdn_decode_packed_vllm(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, state_indices, out, seq_lens=None):
     """Int-state GDN decode-only step with the copy of vLLM's packed kernel (reads [q|k|v] directly)."""
-    from linquant.kernels.state_int.fused_sigmoid_gating_int import fused_recurrent_gated_delta_rule_packed_decode_int
+    from linquant.kernels.state_int.gdn.fused_sigmoid_gating_int import fused_recurrent_gated_delta_rule_packed_decode_int
 
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
@@ -233,7 +233,7 @@ def linq_gdn_decode_packed_vllm(mixer, mixed_qkv, a, b, A_log, dt_bias, scale, s
 # copy of vLLM's fused_recurrent_kda (rule 2026-09-04: INT state only on copies of vLLM's own kernel).
 def linq_kda_decode_vllm(mixer, q, k, v, g, beta, cu_seqlens, state_indices, seq_lens=None):
     """Int-state KDA decode step; same arguments as vLLM's ``fused_recurrent_kda`` call site."""
-    from linquant.kernels.state_int.fused_recurrent_kda_vllm_int import fused_recurrent_kda_int
+    from linquant.kernels.state_int.kda.fused_recurrent_kda_vllm_int import fused_recurrent_kda_int
 
     pools = _pools(mixer)
     assert pools is not None, "LINQ int state: decode before cache pools are bound"
