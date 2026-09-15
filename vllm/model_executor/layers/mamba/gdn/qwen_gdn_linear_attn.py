@@ -27,7 +27,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.linq_state_int import (
+from linquant.backends.vllm.state import (
     linq_bits,
     linq_gdn_decode_packed_vllm,
     linq_gdn_decode_vllm,
@@ -483,7 +483,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        from vllm.model_executor.layers.linq_wa_rotate import make_ro  # LINQ-WA-ROT
+        from linquant.backends.vllm.wa_rotations import make_ro  # LINQ-WA-ROT
 
         self.linq_ro = make_ro(self.value_dim)
 

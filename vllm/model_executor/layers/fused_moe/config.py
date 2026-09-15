@@ -889,24 +889,6 @@ def nvfp4_w4a16_moe_quant_config(
     )
 
 
-def int4_w4a8_moe_quant_config(
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    group_size: int,
-) -> FusedMoEQuantConfig:
-    """
-    LINQ: dynamic per-token int8 activations and int4 group-scaled weights (the
-    llm-compressor W4A8 scheme on MoE experts), served by the Triton wna16 kernel's
-    int4_w4a8 branch.
-    """
-    return FusedMoEQuantConfig(
-        _a1=FusedMoEQuantDesc(torch.int8, GroupShape.PER_TOKEN),
-        _a2=FusedMoEQuantDesc(torch.int8, GroupShape.PER_TOKEN),
-        _w1=FusedMoEQuantDesc("int4", GroupShape(1, group_size), w1_scale),
-        _w2=FusedMoEQuantDesc("int4", GroupShape(1, group_size), w2_scale),
-    )
-
-
 def int4_w4a16_moe_quant_config(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,

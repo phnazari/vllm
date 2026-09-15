@@ -22,25 +22,25 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.mamba.linq_state_int import (  # LINQ-STATE
+from linquant.backends.vllm.state import (  # LINQ-STATE
     linq_bits,
     linq_scratch,
     linq_unpack_slots,
 )
-from vllm.model_executor.layers.mamba.ops.unrotate_norm_gated import (  # LINQ-ROT
+from linquant.kernels.rotations.unrotate_norm_gated_vllm import (  # LINQ-ROT
     unrotate_rmsnorm_gated,
 )
-from vllm.model_executor.layers.mamba.linq_rotate import (  # LINQ-ROT
+from linquant.backends.vllm.state_rotations import (  # LINQ-ROT
     linq_norm_fused,
     linq_norm_matrix,
     linq_rot_any,
     linq_unrotate_x,
     mamba2_spec,
 )
-from vllm.model_executor.layers.mamba.ops.causal_conv1d_butterfly import (  # LINQ-ROT
+from linquant.kernels.rotations.causal_conv1d_butterfly_vllm import (  # LINQ-ROT
     causal_conv1d_fn as causal_conv1d_fn_rot,
 )
-from vllm.model_executor.layers.mamba.ops.causal_conv1d_butterfly import (  # LINQ-ROT
+from linquant.kernels.rotations.causal_conv1d_butterfly_vllm import (  # LINQ-ROT
     causal_conv1d_update as causal_conv1d_update_rot,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -513,7 +513,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        from vllm.model_executor.layers.linq_wa_rotate import make_ro  # LINQ-WA-ROT
+        from linquant.backends.vllm.wa_rotations import make_ro  # LINQ-WA-ROT
 
         self.linq_ro = make_ro(intermediate_size)
 
@@ -1032,7 +1032,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
                 # LINQ-STATE: prefill->decode handoff — pack the fresh final states into
                 # the packed-int pools; decode below reads/writes only those.
-                from vllm.model_executor.layers.mamba.linq_state_int import (
+                from linquant.backends.vllm.state import (
                     linq_dump_handoff_state,
                     linq_pack_slots,
                 )
@@ -1125,7 +1125,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             # NOTE: final output is an in-place update of out tensor
 
             # LINQ-STATE: decode on the packed-int state pools instead of ssm_state.
-            from vllm.model_executor.layers.mamba.linq_state_int import linq_decode
+            from linquant.backends.vllm.state import linq_decode
 
             if linq_bits():
                 linq_decode(

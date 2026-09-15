@@ -3,7 +3,6 @@
 """Fused MoE Triton kernels."""
 
 import functools
-import math
 import json
 import os
 from typing import Any
@@ -106,12 +105,6 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
-    # LINQ int4 x int8 (Kimi W4A8 experts): A is int8 with one fp32 scale per token
-    # (a_scale_ptr[token * stride_asm]); the int4 weights and their group scales use the
-    # W4A16 layout above. The int32 block product is scaled per (group, column) in fp32.
-    a_scale_ptr=None,
-    stride_asm=0,
-    use_int4_w4a8: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -191,7 +184,7 @@ def fused_moe_kernel_gptq_awq(
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    if use_int4_w4a16 or use_int4_w4a8:
+    if use_int4_w4a16:
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
@@ -237,72 +230,53 @@ def fused_moe_kernel_gptq_awq(
             other=0.0,
         )
         b = tl.load(b_ptrs)
-        if use_int4_w4a16 or use_int4_w4a8:
+        if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
-        if use_int4_w4a8:
-            # LINQ int4 x int8: one weight scale per (group, column). The launcher pins
-            # BLOCK_SIZE_K to a divisor of group_size, so a K block never straddles a group
-            # and the int32 block product is scaled once in fp32.
-            b_scale_i = tl.load(
-                b_scale_ptr
-                + off_experts * stride_bse
-                + offs_bn * stride_bsn
-                + ((BLOCK_SIZE_K * k) // group_size) * stride_bsk
-            ).to(tl.float32)
-            b_i8 = (b.to(tl.int32) - 8).to(tl.int8)
-            accumulator += tl.dot(a, b_i8).to(tl.float32) * b_scale_i[None, :]
-        else:
-            b_scale_ptrs = (
-                b_scale_ptr
-                + off_experts * stride_bse
-                + offs_bn[None, :] * stride_bsn
-                + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bn[None, :] * stride_bsn
+            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+        )
+        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+        b_scale = b_scale.to(tl.float32)
+
+        if has_zp and use_int4_w4a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + (offs_bn[None, :] // 2) * stride_bzn
+                + offs_k_true * stride_bzk
             )
-            b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-            b_scale = b_scale.to(tl.float32)
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = (b_zp >> b_zp_shifter) & 0xF
+            b_zp = b_zp.to(tl.float32)
+        elif has_zp and use_int8_w8a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + offs_bn[None, :] * stride_bzn
+                + offs_k_true * stride_bzk
+            )
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = b_zp.to(tl.float32)
 
-            if has_zp and use_int4_w4a16:
-                offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
-                b_zp_ptrs = (
-                    b_zp_ptr
-                    + off_experts * stride_bze
-                    + (offs_bn[None, :] // 2) * stride_bzn
-                    + offs_k_true * stride_bzk
-                )
-                b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
-                b_zp = (b_zp >> b_zp_shifter) & 0xF
-                b_zp = b_zp.to(tl.float32)
-            elif has_zp and use_int8_w8a16:
-                offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
-                b_zp_ptrs = (
-                    b_zp_ptr
-                    + off_experts * stride_bze
-                    + offs_bn[None, :] * stride_bzn
-                    + offs_k_true * stride_bzk
-                )
-                b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
-                b_zp = b_zp.to(tl.float32)
-
-            # We accumulate along the K dimension.
-            if has_zp:
-                b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
-            else:
-                b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-            accumulator = tl.dot(a, b, acc=accumulator)
+        # We accumulate along the K dimension.
+        if has_zp:
+            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+        else:
+            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+        accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        if use_int4_w4a16 or use_int4_w4a8:
+        if use_int4_w4a16:
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    if use_int4_w4a8:
-        a_scale = tl.load(
-            a_scale_ptr + (offs_token // top_k) * stride_asm, mask=token_mask, other=0.0
-        )
-        accumulator = accumulator * a_scale[:, None]
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
@@ -686,8 +660,6 @@ def invoke_fused_moe_wna16_triton_kernel(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
-    A_scale: torch.Tensor | None = None,
-    use_int4_w4a8: bool = False,
 ):
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
@@ -721,12 +693,6 @@ def invoke_fused_moe_wna16_triton_kernel(
             block_size_m=config["BLOCK_SIZE_M"],
         )
     )
-    if use_int4_w4a8:  # LINQ: int8 dot with one scale per K block -> the block must sit inside a group
-        assert A.dtype == torch.int8 and A_scale is not None and A_scale.dim() == 2, (A.dtype, A_scale)
-        assert B_zp is None, "int4 x int8 path: symmetric weights only"
-        bk = math.gcd(math.gcd(config["BLOCK_SIZE_K"], block_shape[1]), A.size(1))
-        assert bk >= 16, (config["BLOCK_SIZE_K"], block_shape[1], A.size(1))
-        config["BLOCK_SIZE_K"] = bk
 
     fused_moe_kernel_gptq_awq[grid](
         A,
@@ -763,9 +729,6 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
-        a_scale_ptr=A_scale,
-        stride_asm=A_scale.stride(0) if A_scale is not None else 0,
-        use_int4_w4a8=use_int4_w4a8,
         **config,
     )
 
@@ -923,7 +886,32 @@ def dispatch_fused_moe_kernel(
     ):
         assert B_bias is None
 
-        use_moe_wna16_cuda = (not use_int4_w4a8) and should_moe_wna16_use_cuda(
+        if use_int4_w4a8:
+            from linquant.kernels.moe.w4a8_vllm import invoke_fused_moe_w4a8_triton_kernel
+
+            invoke_fused_moe_w4a8_triton_kernel(
+                A,
+                B,
+                C,
+                B_scale,
+                B_zp,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                top_k,
+                config,
+                compute_type,
+                use_int8_w8a16,
+                use_int4_w4a16,
+                block_shape,
+                A_scale=A_scale,
+                use_int4_w4a8=use_int4_w4a8,
+            )
+            return
+
+        use_moe_wna16_cuda = should_moe_wna16_use_cuda(
             num_valid_tokens=num_tokens,
             group_size=block_shape[1],
             num_experts=B.size(0),
@@ -964,8 +952,6 @@ def dispatch_fused_moe_kernel(
             use_int8_w8a16,
             use_int4_w4a16,
             block_shape,
-            A_scale=A_scale,
-            use_int4_w4a8=use_int4_w4a8,
         )
 
     else:
@@ -1808,10 +1794,9 @@ def fused_experts_impl(
     apply_moe_activation(
         activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
     )
-    from vllm.model_executor.layers.fused_moe import modular_kernel as _mk  # LINQ-WA-ROT (see modular_kernel)
+    from linquant.backends.vllm.wa_rotations import apply_expert_r4
 
-    if _mk._LINQ_R4 is not None and intermediate_cache2.shape[-1] == _mk._LINQ_R4.n:
-        intermediate_cache2.copy_(_mk._LINQ_R4(intermediate_cache2))
+    apply_expert_r4(intermediate_cache2)
 
     qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
         A=intermediate_cache2,

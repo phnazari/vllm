@@ -8,11 +8,14 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-from contextlib import contextmanager
-
 import torch
 
 from vllm.triton_utils import tl, triton
+
+from linquant.backends.vllm.decode_tuning import (
+    gdn_decode_config,
+    override_gdn_decode_config,  # noqa: F401 - preserve the fork's tuning API
+)
 
 from .op import exp
 
@@ -338,36 +341,6 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
-# LINQ-STATE: (BV, warps, stages) per batch for this fp32 baseline kernel (vLLM hardcodes 32/1/3),
-# swept with the same cold-L2 recipe as our int kernels: scripts/investigate/vllm_qwen_launch_tune.py
-# --arms fp, Qwen3.5-9B shapes (HV=32, K=V=128), H100 SXM, 2026-09-04. Baked; re-run the tuner and
-# paste its "fp" table here to re-bake.
-_LINQ_TUNED_FP = {
-    1: (128, 4, 2),
-    2: (8, 8, 3),
-    4: (8, 1, 3),
-    8: (8, 1, 1),
-    16: (8, 1, 2),
-    32: (8, 1, 2),
-    64: (8, 1, 1),
-    128: (32, 8, 1),
-}
-
-_linq_gdn_cfg: tuple[int, int, int] | None = None
-
-
-@contextmanager
-def override_gdn_decode_config(config: tuple[int, int, int] | None):
-    """LINQ-STATE: pin (BV, num_warps, num_stages) for the packed decode kernel."""
-    global _linq_gdn_cfg
-    prev = _linq_gdn_cfg
-    _linq_gdn_cfg = config
-    try:
-        yield
-    finally:
-        _linq_gdn_cfg = prev
-
-
 def fused_recurrent_gated_delta_rule_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -469,14 +442,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     BV = min(triton.next_power_of_2(V), 32)
     num_stages = 3
     num_warps = 1
-    # LINQ-STATE: tuning override, else the per-batch table swept with our recipe.
-    if _linq_gdn_cfg is not None:
-        BV, num_warps, num_stages = _linq_gdn_cfg
-    elif _LINQ_TUNED_FP:
-        for _b in (128, 64, 32, 16, 8, 4, 2, 1):
-            if _b <= B and _b in _LINQ_TUNED_FP:
-                BV, num_warps, num_stages = _LINQ_TUNED_FP[_b]
-                break
+    BV, num_warps, num_stages = gdn_decode_config(B, (BV, num_warps, num_stages))
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)

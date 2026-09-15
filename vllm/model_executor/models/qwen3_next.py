@@ -36,7 +36,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
-from vllm.model_executor.layers.mamba.linq_config import set_current as linq_set_config
+from linquant.backends.vllm.config import set_current as linq_set_config
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,

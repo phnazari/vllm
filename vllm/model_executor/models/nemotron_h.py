@@ -47,7 +47,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-from vllm.model_executor.layers.mamba.linq_config import set_current as linq_set_config
+from linquant.backends.vllm.config import set_current as linq_set_config
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -114,7 +114,7 @@ class NemotronHMLP(nn.Module):
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
-        from vllm.model_executor.layers.linq_wa_rotate import make_r4  # LINQ-WA-ROT
+        from linquant.backends.vllm.wa_rotations import make_r4  # LINQ-WA-ROT
 
         self.linq_r4 = make_r4(intermediate_size, prefix)
         self.act_fn = ReLUSquaredActivation()

@@ -217,7 +217,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.g_b_proj",
         )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
-        from vllm.model_executor.layers.linq_wa_rotate import make_ro  # LINQ-WA-ROT
+        from linquant.backends.vllm.wa_rotations import make_ro  # LINQ-WA-ROT
 
         self.linq_ro = make_ro(projection_size)  # KDA o_proj-input Hadamard (inverse folded at export)
         self.o_proj = RowParallelLinear(
@@ -306,7 +306,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         beta = beta[:, :num_actual_tokens]
 
         # LINQ-STATE: (conv, codes, scales) under the int state; the fp state is prefill scratch
-        from vllm.model_executor.layers.mamba.linq_state_int import (
+        from linquant.backends.vllm.state import (
             linq_bits, linq_kda_decode_vllm, linq_pack_slots, linq_scratch, linq_unpack_slots)
 
         conv_state = constant_caches[0]

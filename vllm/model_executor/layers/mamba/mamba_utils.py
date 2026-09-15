@@ -80,7 +80,7 @@ class MambaStateDtypeCalculator:
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
         # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
-        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+        from linquant.backends.vllm.state import linq_bits
 
         if linq_bits():
             dtypes = (dtypes[0], torch.uint8, torch.float32)
@@ -121,7 +121,7 @@ class MambaStateDtypeCalculator:
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
         # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
-        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+        from linquant.backends.vllm.state import linq_bits
 
         if linq_bits():
             dtypes = (dtypes[0], torch.uint8, torch.float32)
@@ -135,7 +135,7 @@ class MambaStateDtypeCalculator:
     ) -> tuple[torch.dtype, torch.dtype]:
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
-        from vllm.model_executor.layers.mamba.linq_state_int import linq_bits
+        from linquant.backends.vllm.state import linq_bits
 
         if linq_bits():
             return (state_dtype, torch.uint8, torch.float32)
@@ -204,7 +204,7 @@ class MambaStateShapeCalculator:
 
         # LINQ-STATE: the int8 arm keeps ONLY codes [H, D, state] + scales [H, D] per slot; the fp state
         # is prefill scratch, so it never enters the page. The asymmetric grid stores (scale, min) per row.
-        from vllm.model_executor.layers.mamba.linq_state_int import linq_asym, linq_bits
+        from linquant.backends.vllm.state import linq_asym, linq_bits
 
         if linq_bits():
             heads = divide(num_heads, tp_world_size)
@@ -260,7 +260,7 @@ class MambaStateShapeCalculator:
 
         # LINQ-STATE: value-grouped int state ONLY (same value-major layout as the fp pool);
         # the fp state is prefill scratch, so it never enters the page.
-        from vllm.model_executor.layers.mamba.linq_state_int import linq_asym, linq_bits
+        from linquant.backends.vllm.state import linq_asym, linq_bits
 
         if linq_bits():
             hv = divide(num_v_heads, tp_world_size)
@@ -294,10 +294,10 @@ class MambaStateShapeCalculator:
         recurrent_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
         # LINQ-STATE: value-grouped int state in vLLM's own value-major [H, V, K] layout
         # (fused_recurrent_kda indexes the pool as [.., V, K]); the fp state is prefill scratch.
-        from vllm.model_executor.layers.mamba.linq_state_int import linq_asym, linq_bits
+        from linquant.backends.vllm.state import linq_asym, linq_bits
 
         if linq_bits():
-            from vllm.model_executor.layers.mamba.linq_state_int import linq_config
+            from linquant.backends.vllm.state import linq_config
 
             heads = divide(num_heads, tp_world_size)
             # scales: one per value row (V = head_dim) or, key axis, one per key channel (K = head_k_dim)

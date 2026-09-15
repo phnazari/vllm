@@ -41,7 +41,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
-from vllm.model_executor.layers.mamba.linq_config import set_current as linq_set_config
+from linquant.backends.vllm.config import set_current as linq_set_config
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -170,7 +170,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
-            from vllm.model_executor.layers.linq_wa_rotate import make_r4  # LINQ-WA-ROT
+            from linquant.backends.vllm.wa_rotations import make_r4  # LINQ-WA-ROT
 
             self.mlp.linq_r4 = make_r4(config.intermediate_size, f"{prefix}.mlp")
         else:
