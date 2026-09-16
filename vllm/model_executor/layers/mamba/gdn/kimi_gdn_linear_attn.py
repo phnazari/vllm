@@ -217,7 +217,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.g_b_proj",
         )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
-        from linquant.backends.vllm.wa_rotations import make_ro  # LINQ-WA-ROT
+        from linquant.backends.vllm.rotations import make_ro  # LINQ-WA-ROT
 
         self.linq_ro = make_ro(projection_size)  # KDA o_proj-input Hadamard (inverse folded at export)
         self.o_proj = RowParallelLinear(

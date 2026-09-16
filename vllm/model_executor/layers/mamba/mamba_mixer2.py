@@ -27,20 +27,20 @@ from linquant.backends.vllm.state import (  # LINQ-STATE
     linq_scratch,
     linq_unpack_slots,
 )
-from linquant.kernels.rotations.unrotate_norm_gated_vllm import (  # LINQ-ROT
+from linquant.kernels.rotations.unrotate_norm_vllm import (  # LINQ-ROT
     unrotate_rmsnorm_gated,
 )
-from linquant.backends.vllm.state_rotations import (  # LINQ-ROT
+from linquant.backends.vllm.rotations import (  # LINQ-ROT
     linq_norm_fused,
     linq_norm_matrix,
     linq_rot_any,
     linq_unrotate_x,
     mamba2_spec,
 )
-from linquant.kernels.rotations.causal_conv1d_butterfly_vllm import (  # LINQ-ROT
+from linquant.kernels.rotations.conv_vllm import (  # LINQ-ROT
     causal_conv1d_fn as causal_conv1d_fn_rot,
 )
-from linquant.kernels.rotations.causal_conv1d_butterfly_vllm import (  # LINQ-ROT
+from linquant.kernels.rotations.conv_vllm import (  # LINQ-ROT
     causal_conv1d_update as causal_conv1d_update_rot,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -513,7 +513,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        from linquant.backends.vllm.wa_rotations import make_ro  # LINQ-WA-ROT
+        from linquant.backends.vllm.rotations import make_ro  # LINQ-WA-ROT
 
         self.linq_ro = make_ro(intermediate_size)
 

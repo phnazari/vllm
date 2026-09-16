@@ -114,7 +114,7 @@ class NemotronHMLP(nn.Module):
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
-        from linquant.backends.vllm.wa_rotations import make_r4  # LINQ-WA-ROT
+        from linquant.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
 
         self.linq_r4 = make_r4(intermediate_size, prefix)
         self.act_fn = ReLUSquaredActivation()

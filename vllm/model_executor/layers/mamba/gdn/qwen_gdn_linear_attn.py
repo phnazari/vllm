@@ -483,7 +483,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        from linquant.backends.vllm.wa_rotations import make_ro  # LINQ-WA-ROT
+        from linquant.backends.vllm.rotations import make_ro  # LINQ-WA-ROT
 
         self.linq_ro = make_ro(self.value_dim)
 

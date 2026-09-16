@@ -170,7 +170,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
-            from linquant.backends.vllm.wa_rotations import make_r4  # LINQ-WA-ROT
+            from linquant.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
 
             self.mlp.linq_r4 = make_r4(config.intermediate_size, f"{prefix}.mlp")
         else:

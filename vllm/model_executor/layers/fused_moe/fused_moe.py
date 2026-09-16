@@ -1794,7 +1794,7 @@ def fused_experts_impl(
     apply_moe_activation(
         activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
     )
-    from linquant.backends.vllm.wa_rotations import apply_expert_r4
+    from linquant.backends.vllm.rotations import apply_expert_r4
 
     apply_expert_r4(intermediate_cache2)
 

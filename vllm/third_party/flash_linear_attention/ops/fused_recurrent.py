@@ -12,10 +12,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-from linquant.backends.vllm.decode_tuning import (
-    gdn_decode_config,
-    override_gdn_decode_config,  # noqa: F401 - preserve the fork's tuning API
-)
+from linquant.backends.vllm.decode_tuning import gdn_decode_config
 
 from .op import exp
 
