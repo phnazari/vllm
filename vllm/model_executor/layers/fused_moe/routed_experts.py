@@ -207,6 +207,7 @@ class RoutedExperts(PluggableLayer):
             "AutoGPTQMoEMethod",
             "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
+            "LinqW4A8IntMoEMethod",
             "CompressedTensorsW4A16FlydslMoEMethod",
         )
 
@@ -628,6 +629,7 @@ class RoutedExperts(PluggableLayer):
         if quant_method_name in (
             "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
+            "LinqW4A8IntMoEMethod",
             "CompressedTensorsWNA16RDNA3MoEMethod",
             "CompressedTensorsW4A16FlydslMoEMethod",
         ):

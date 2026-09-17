@@ -77,6 +77,15 @@ def get_ssm_configs(
     """
     cache_dtype = _canonical_cache_dtype(cache_dtype)
     device_name = get_ssm_device_name()
+    from linquant.backends.vllm.decode_tuning import override_table
+
+    linq_configs = override_table("mamba_fp")
+    if linq_configs is not None:
+        if (headdim, dstate, cache_dtype, device_name.replace(" ", "_")) != (
+            64, 128, "float32", "NVIDIA_H100_80GB_HBM3"
+        ):
+            raise ValueError("The explicit LinQuant serving table requires H100, headdim=64, dstate=128, FP32")
+        return linq_configs
     json_file_name = get_ssm_config_file_name(headdim, dstate, cache_dtype, device_name)
 
     config_file_paths: list[str] = []
