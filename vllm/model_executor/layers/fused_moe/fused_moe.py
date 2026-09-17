@@ -903,11 +903,8 @@ def dispatch_fused_moe_kernel(
                 top_k,
                 config,
                 compute_type,
-                use_int8_w8a16,
-                use_int4_w4a16,
                 block_shape,
                 A_scale=A_scale,
-                use_int4_w4a8=use_int4_w4a8,
             )
             return
 
