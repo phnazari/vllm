@@ -307,7 +307,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # LINQ-STATE: (conv, codes, scales) under the int state; the fp state is prefill scratch
         from linquant.backends.vllm.state import (
-            linq_bits, linq_kda_decode_vllm, linq_pack_slots, linq_scratch, linq_unpack_slots)
+            linq_bits, linq_fake, linq_fake_quant_slots, linq_kda_decode_vllm, linq_pack_slots,
+            linq_scratch, linq_unpack_slots)
 
         conv_state = constant_caches[0]
         recurrent_state = None if linq_bits() else constant_caches[1]
@@ -435,6 +436,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 linq_pack_slots(self, non_spec_state_indices_tensor, last_recurrent_state)
             else:
                 recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+                if linq_fake():  # LINQ-STATE: fake-quantized storage, same format as the HF cells
+                    linq_fake_quant_slots(self, recurrent_state, non_spec_state_indices_tensor)
         else:
             assert non_spec_query_start_loc is not None
             g1 = fused_kda_gate(
@@ -466,6 +469,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                 )
+                if linq_fake():  # LINQ-STATE: fake-quantized storage after the in-place decode update
+                    linq_fake_quant_slots(self, recurrent_state, non_spec_state_indices_tensor)
         core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
             0, :num_actual_tokens
         ]
