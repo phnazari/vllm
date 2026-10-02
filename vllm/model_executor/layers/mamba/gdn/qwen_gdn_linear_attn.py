@@ -29,6 +29,8 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from linquant.backends.vllm.state import (
     linq_bits,
+    linq_fake,
+    linq_fake_quant_slots,
     linq_gdn_decode_packed_vllm,
     linq_gdn_decode_vllm,
     linq_pack_slots,
@@ -1456,6 +1458,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                 )
+                if linq_fake():  # LINQ-STATE: fake-quantized storage after the in-place decode update
+                    linq_fake_quant_slots(self, ssm_state, non_spec_state_indices_tensor, transposed=True)
         else:
             core_attn_out_decode = None
 
@@ -1499,6 +1503,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 linq_pack_slots(self, prefill_state_indices, last_recurrent_state)
             else:
                 ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+                if linq_fake():  # LINQ-STATE: fake-quantized storage, same format as the HF cells
+                    linq_fake_quant_slots(self, ssm_state, prefill_state_indices, transposed=True)
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1535,6 +1541,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                     )
                 )
+                if linq_fake():  # LINQ-STATE: fake-quantized storage after the in-place decode update
+                    linq_fake_quant_slots(self, ssm_state, non_spec_state_indices_tensor, transposed=True)
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
@@ -1678,6 +1686,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state_indices=slots,
             use_qk_l2norm_in_kernel=True,
         )
+        if linq_fake():  # LINQ-STATE: fake-quantized storage after the packed decode update
+            linq_fake_quant_slots(self, ssm_state, slots, transposed=True)
         return
 
 
