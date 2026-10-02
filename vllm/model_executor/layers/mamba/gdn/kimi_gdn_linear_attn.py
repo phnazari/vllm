@@ -437,7 +437,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             else:
                 recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
                 if linq_fake():  # LINQ-STATE: fake-quantized storage, same format as the HF cells
-                    linq_fake_quant_slots(self, recurrent_state, non_spec_state_indices_tensor)
+                    linq_fake_quant_slots(self, recurrent_state, non_spec_state_indices_tensor, transposed=True)
         else:
             assert non_spec_query_start_loc is not None
             g1 = fused_kda_gate(
@@ -470,7 +470,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ssm_state_indices=non_spec_state_indices_tensor,
                 )
                 if linq_fake():  # LINQ-STATE: fake-quantized storage after the in-place decode update
-                    linq_fake_quant_slots(self, recurrent_state, non_spec_state_indices_tensor)
+                    linq_fake_quant_slots(self, recurrent_state, non_spec_state_indices_tensor, transposed=True)
         core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
             0, :num_actual_tokens
         ]
