@@ -24,6 +24,9 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from linquant.backends.vllm.state import (  # LINQ-STATE
     linq_bits,
+    linq_config,
+    linq_fake,
+    linq_fake_quant_slots,
     linq_scratch,
     linq_unpack_slots,
 )
@@ -1029,6 +1032,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 assert state_indices_tensor_p is not None
                 if not linq_bits():
                     ssm_state[state_indices_tensor_p] = varlen_states
+                    if linq_fake():  # LINQ-STATE: fake-quantized storage; DAMP wants [.., state, dim] = [K, V]
+                        linq_fake_quant_slots(
+                            self, ssm_state, state_indices_tensor_p, transposed=bool(linq_config().damp)
+                        )
 
                 # LINQ-STATE: prefill->decode handoff — pack the fresh final states into
                 # the packed-int pools; decode below reads/writes only those.
@@ -1162,6 +1169,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+                if linq_fake():  # LINQ-STATE: fake-quantized storage after the in-place decode update
+                    linq_fake_quant_slots(
+                        self, ssm_state, state_indices_tensor_d_output, transposed=bool(linq_config().damp)
+                    )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None

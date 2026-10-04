@@ -207,8 +207,12 @@ class MambaStateShapeCalculator:
         from linquant.backends.vllm.state import linq_asym, linq_bits
 
         if linq_bits():
+            from linquant.backends.vllm.state import linq_config
+
             heads = divide(num_heads, tp_world_size)
-            scales_shape = (heads, head_dim, 2) if linq_asym() else (heads, head_dim)
+            # scales: one per state row (head_dim) or, key axis, one per state column (state_size)
+            rows = state_size if linq_config().state_axis == "key" else head_dim
+            scales_shape = (heads, rows, 2) if linq_asym() else (heads, rows)
             return (conv_state_shape, (heads, head_dim, state_size), scales_shape)
         return conv_state_shape, temporal_state_shape
 
@@ -263,8 +267,11 @@ class MambaStateShapeCalculator:
         from linquant.backends.vllm.state import linq_asym, linq_bits
 
         if linq_bits():
+            from linquant.backends.vllm.state import linq_config
+
             hv = divide(num_v_heads, tp_world_size)
-            scales_shape = (hv, head_v_dim, 2) if linq_asym() else (hv, head_v_dim)
+            rows = head_k_dim if linq_config().state_axis == "key" else head_v_dim  # key axis: one per key channel
+            scales_shape = (hv, rows, 2) if linq_asym() else (hv, rows)
             return (conv_state_shape, (hv, head_v_dim, head_k_dim), scales_shape)
         return conv_state_shape, temporal_state_shape
 
