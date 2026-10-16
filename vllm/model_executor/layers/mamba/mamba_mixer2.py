@@ -24,20 +24,14 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from linquant.backends.vllm.state import (  # LINQ-STATE
     linq_bits,
-    linq_config,
-    linq_fake,
-    linq_fake_quant_slots,
+    linq_decode,
+    linq_pack_slots,
     linq_scratch,
     linq_unpack_slots,
 )
-from linquant.kernels.rotations.unrotate_norm_vllm import (  # LINQ-ROT
-    unrotate_rmsnorm_gated,
-)
-from linquant.backends.vllm.rotations import (  # LINQ-ROT
-    linq_norm_fused,
-    linq_norm_matrix,
+from linquant.backends.vllm.rotations import (  # LINQ-ROT / LINQ-WA-ROT
     linq_rot_any,
-    linq_unrotate_x,
+    make_ro,
     mamba2_spec,
 )
 from linquant.kernels.rotations.conv_vllm import (  # LINQ-ROT
@@ -96,19 +90,11 @@ class Mixer2RMSNormGated(CustomOp):
         full_n_groups: int,
         use_rms_norm: bool = True,
         eps: float = 1e-6,
-        head_dim: int | None = None,  # LINQ-ROT: needed to undo R_v
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.full_hidden_size = full_hidden_size
-        rmat = linq_norm_matrix(head_dim)  # LINQ-ROT
-        self._linq_unrot = rmat is not None
-        self._linq_norm_fused = linq_norm_fused()  # LINQ-ROT: resolved once, the forward is compiled
-        self._linq_head_dim = head_dim or 1
-        if rmat is not None:  # buffers, so the module move puts them on the GPU at load
-            self.register_buffer("_linq_rmat", rmat, persistent=False)
-            self.register_buffer("_linq_signs", rmat[:, 0].sign(), persistent=False)
         self.group_size = full_hidden_size // full_n_groups
         self.per_rank_hidden_size = full_hidden_size // self.tp_size
         self.n_groups = full_hidden_size // self.group_size
@@ -141,18 +127,6 @@ class Mixer2RMSNormGated(CustomOp):
         #   3. The general case can be pretty complicated so we AllGather
         #      the input and then redundantly compute the RMSNorm.
         input_dtype = x.dtype
-        if self._linq_norm_fused and self.use_rms_norm and self.tp_size == 1:
-            return unrotate_rmsnorm_gated(  # LINQ-ROT: same kernel with and without R_v
-                x,
-                gate,
-                self.weight,
-                self._linq_signs if self._linq_unrot else None,
-                self._linq_head_dim,
-                self.group_size,
-                self.variance_epsilon,
-            )
-        if self._linq_unrot:  # LINQ-ROT: undo R_v before gate and RMS
-            x = linq_unrotate_x(x, self._linq_rmat)
         x = x * nn.functional.silu(gate.to(torch.float32))
         if not self.use_rms_norm:
             return x.to(input_dtype)
@@ -196,9 +170,8 @@ class Mixer2RMSNormGated(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         input_dtype = x.dtype
         if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
-            return self.forward_native(x, gate)  # unrotates there; do NOT do it twice
-        if self._linq_unrot:  # LINQ-ROT: undo R_v before gate and RMS
-            x = linq_unrotate_x(x, self._linq_rmat)
+            return self.forward_native(x, gate)
+
         if not self.use_rms_norm:
             # Keep gate in float32 for numerical stability during silu
             return x * nn.functional.silu(gate.to(torch.float32)).to(input_dtype)
@@ -516,16 +489,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        from linquant.backends.vllm.rotations import make_ro  # LINQ-WA-ROT
-
-        self.linq_ro = make_ro(intermediate_size)
+        self.linq_ro = make_ro(intermediate_size)  # LINQ-WA-ROT
 
         self.norm = Mixer2RMSNormGated(
             intermediate_size,
             n_groups,
             self.use_rms_norm,
             eps=rms_norm_eps,
-            head_dim=head_dim,  # LINQ-ROT
         )
 
         self._ssd_kernels_warmed_up = False
@@ -760,9 +730,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
             # LINQ-STATE: the int arms have no fp pool -- kv_cache[1:] is codes/scales and the
             # fp state is per-batch scratch, so nothing below may touch `ssm_state`.
             ssm_state = None if linq_bits() else self.kv_cache[1]
-            assert not (linq_bits() and is_mamba_cache_all), (
-                "LINQ int state: mamba_cache_mode must be 'none'"
-            )
             has_initial_states_p = attn_metadata.has_initial_states_p
             prep_initial_states = attn_metadata.prep_initial_states
             chunk_size = attn_metadata.chunk_size
@@ -906,10 +873,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         1, block_idx_last_computed_token_p.unsqueeze(1)
                     ).squeeze(1)
                 if linq_bits():  # LINQ-STATE: dequantize the slots we continue from
-                    scratch = linq_scratch(
-                        self, kernel_ssm_indices.shape[0],
-                        (self.num_heads // self.tp_size, self.head_dim, self.ssm_state_size),
-                        hidden_states_p.device)
+                    scratch = linq_scratch(self, kernel_ssm_indices.shape[0], hidden_states_p.device)
                     linq_unpack_slots(self, kernel_ssm_indices, scratch)
                     initial_states = torch.where(
                         has_initial_states_p[:, None, None, None], scratch, 0)
@@ -1030,26 +994,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 # - varlen state is a (num_prefills, nheads, headdim, dstate)
                 #   tensor
                 assert state_indices_tensor_p is not None
-                if not linq_bits():
-                    ssm_state[state_indices_tensor_p] = varlen_states
-                    if linq_fake():  # LINQ-STATE: fake-quantized storage; DAMP wants [.., state, dim] = [K, V]
-                        linq_fake_quant_slots(
-                            self, ssm_state, state_indices_tensor_p, transposed=bool(linq_config().damp)
-                        )
-
-                # LINQ-STATE: prefill->decode handoff — pack the fresh final states into
-                # the packed-int pools; decode below reads/writes only those.
-                from linquant.backends.vllm.state import (
-                    linq_dump_handoff_state,
-                    linq_pack_slots,
-                )
-
-                # the fp state the quantizer is about to see -- the HF fake-quant path's
-                # comparison point (linq.dump_state_dir); no-op when unset
-                linq_dump_handoff_state(self, varlen_states)
-
-                if linq_bits():
+                if linq_bits():  # LINQ-STATE: prefill->decode handoff into the int pools
                     linq_pack_slots(self, state_indices_tensor_p, varlen_states)
+                else:
+                    ssm_state[state_indices_tensor_p] = varlen_states
 
         # Process decode requests
         if has_decode:
@@ -1132,8 +1080,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
             # NOTE: final output is an in-place update of out tensor
 
             # LINQ-STATE: decode on the packed-int state pools instead of ssm_state.
-            from linquant.backends.vllm.state import linq_decode
-
             if linq_bits():
                 linq_decode(
                     self,
@@ -1145,10 +1091,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     D_d,
                     dt_bias,
                     state_indices_tensor_d_input,
-                    state_indices_tensor_d_output,
                     preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
-                    num_accepted_tokens,
-                    query_start_loc_d,
                     seq_lens=attn_metadata.seq_lens,  # decode rows come first; SR seed
                 )
             else:
@@ -1169,10 +1112,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
-                if linq_fake():  # LINQ-STATE: fake-quantized storage after the in-place decode update
-                    linq_fake_quant_slots(
-                        self, ssm_state, state_indices_tensor_d_output, transposed=bool(linq_config().damp)
-                    )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None

@@ -84,7 +84,7 @@ def get_ssm_configs(
         if (headdim, dstate, cache_dtype, device_name.replace(" ", "_")) != (
             64, 128, "float32", "NVIDIA_H100_80GB_HBM3"
         ):
-            raise ValueError("The explicit LinQuant serving table requires H100, headdim=64, dstate=128, FP32")
+            raise ValueError("The explicit LoRes serving table requires H100, headdim=64, dstate=128, FP32")
         return linq_configs
     json_file_name = get_ssm_config_file_name(headdim, dstate, cache_dtype, device_name)
 

@@ -27,12 +27,6 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
-def _linq_w4a8_int(quant_config, weight_quant, input_quant) -> bool:
-    from linquant.backends.vllm.moe import is_linq_w4a8_int
-
-    return is_linq_w4a8_int(quant_config, weight_quant, input_quant)
-
-
 class CompressedTensorsMoEMethod(FusedMoEMethodBase):
     @staticmethod
     def get_moe_method(
@@ -68,6 +62,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
         format = scheme_dict.get("format")
+        from linquant.backends.vllm.moe import LinqW4A8IntMoEMethod, is_linq_w4a8_int
 
         if quant_config._is_mxfp4(weight_quant):
             from .compressed_tensors_moe_w4a4_mxfp4 import (
@@ -227,11 +222,9 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             return CompressedTensorsW4A8Fp8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
             )
-        elif _linq_w4a8_int(quant_config, weight_quant, input_quant):
+        elif is_linq_w4a8_int(quant_config, weight_quant, input_quant):
             # LINQ: the int8-activation W4A8 scheme on CUDA experts (vLLM's own int4/int8
             # MoE method below is CPU-only)
-            from linquant.backends.vllm.moe import LinqW4A8IntMoEMethod
-
             logger.info_once("Using LinqW4A8IntMoEMethod")
             return LinqW4A8IntMoEMethod(weight_quant, input_quant, layer.moe_config)
         elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):

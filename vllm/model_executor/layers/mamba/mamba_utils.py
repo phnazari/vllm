@@ -80,11 +80,9 @@ class MambaStateDtypeCalculator:
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
         # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
-        from linquant.backends.vllm.state import linq_bits
+        from linquant.backends.vllm.state import linq_cache_dtypes
 
-        if linq_bits():
-            dtypes = (dtypes[0], torch.uint8, torch.float32)
-        return dtypes
+        return linq_cache_dtypes(dtypes)
 
     @classmethod
     def _mamba_state_dtype(
@@ -121,11 +119,9 @@ class MambaStateDtypeCalculator:
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
         # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
-        from linquant.backends.vllm.state import linq_bits
+        from linquant.backends.vllm.state import linq_cache_dtypes
 
-        if linq_bits():
-            dtypes = (dtypes[0], torch.uint8, torch.float32)
-        return dtypes
+        return linq_cache_dtypes(dtypes)
 
     @classmethod
     def kda_state_dtype(
@@ -135,11 +131,9 @@ class MambaStateDtypeCalculator:
     ) -> tuple[torch.dtype, torch.dtype]:
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
-        from linquant.backends.vllm.state import linq_bits
+        from linquant.backends.vllm.state import linq_cache_dtypes
 
-        if linq_bits():
-            return (state_dtype, torch.uint8, torch.float32)
-        return (state_dtype, torch.float32)
+        return linq_cache_dtypes((state_dtype, torch.float32))
 
 
 class MambaStateShapeCalculator:
@@ -202,19 +196,12 @@ class MambaStateShapeCalculator:
         #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
 
-        # LINQ-STATE: the int8 arm keeps ONLY codes [H, D, state] + scales [H, D] per slot; the fp state
-        # is prefill scratch, so it never enters the page. The asymmetric grid stores (scale, min) per row.
-        from linquant.backends.vllm.state import linq_asym, linq_bits
+        # LINQ-STATE: codes + scales per slot; the fp state is prefill scratch and never enters the page.
+        from linquant.backends.vllm.state import linq_cache_shapes
 
-        if linq_bits():
-            from linquant.backends.vllm.state import linq_config
-
-            heads = divide(num_heads, tp_world_size)
-            # scales: one per state row (head_dim) or, key axis, one per state column (state_size)
-            rows = state_size if linq_config().state_axis == "key" else head_dim
-            scales_shape = (heads, rows, 2) if linq_asym() else (heads, rows)
-            return (conv_state_shape, (heads, head_dim, state_size), scales_shape)
-        return conv_state_shape, temporal_state_shape
+        return linq_cache_shapes(
+            conv_state_shape, divide(num_heads, tp_world_size), head_dim, state_size
+        ) or (conv_state_shape, temporal_state_shape)
 
     @classmethod
     def short_conv_state_shape(
@@ -262,18 +249,12 @@ class MambaStateShapeCalculator:
             head_k_dim,
         )
 
-        # LINQ-STATE: value-grouped int state ONLY (same value-major layout as the fp pool);
-        # the fp state is prefill scratch, so it never enters the page.
-        from linquant.backends.vllm.state import linq_asym, linq_bits
+        # LINQ-STATE: codes + scales per slot; the fp state is prefill scratch and never enters the page.
+        from linquant.backends.vllm.state import linq_cache_shapes
 
-        if linq_bits():
-            from linquant.backends.vllm.state import linq_config
-
-            hv = divide(num_v_heads, tp_world_size)
-            rows = head_k_dim if linq_config().state_axis == "key" else head_v_dim  # key axis: one per key channel
-            scales_shape = (hv, rows, 2) if linq_asym() else (hv, rows)
-            return (conv_state_shape, (hv, head_v_dim, head_k_dim), scales_shape)
-        return conv_state_shape, temporal_state_shape
+        return linq_cache_shapes(
+            conv_state_shape, divide(num_v_heads, tp_world_size), head_v_dim, head_k_dim
+        ) or (conv_state_shape, temporal_state_shape)
 
     @classmethod
     def kda_state_shape(
@@ -299,19 +280,12 @@ class MambaStateShapeCalculator:
             divide(conv_dim, tp_world_size), conv_kernel_size - 1
         )
         recurrent_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
-        # LINQ-STATE: value-grouped int state in vLLM's own value-major [H, V, K] layout
-        # (fused_recurrent_kda indexes the pool as [.., V, K]); the fp state is prefill scratch.
-        from linquant.backends.vllm.state import linq_asym, linq_bits
+        # LINQ-STATE: codes + scales per slot in vLLM's value-major [H, V, K] layout; the fp state is prefill scratch.
+        from linquant.backends.vllm.state import linq_cache_shapes
 
-        if linq_bits():
-            from linquant.backends.vllm.state import linq_config
-
-            heads = divide(num_heads, tp_world_size)
-            # scales: one per value row (V = head_dim) or, key axis, one per key channel (K = head_k_dim)
-            rows = head_k_dim if linq_config().state_axis == "key" else head_dim
-            scales_shape = (heads, rows, 2) if linq_asym() else (heads, rows)
-            return (conv_state_shape, (heads, head_dim, head_k_dim), scales_shape)
-        return (conv_state_shape, recurrent_state_shape)
+        return linq_cache_shapes(
+            conv_state_shape, divide(num_heads, tp_world_size), head_dim, head_k_dim
+        ) or (conv_state_shape, recurrent_state_shape)
 
 
 @dataclass
