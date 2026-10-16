@@ -37,6 +37,13 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cuda():
             return False, "requires CUDA."
+        if compute_capability is None:
+            capability = current_platform.get_device_capability()
+            compute_capability = capability.to_int() if capability else None
+        if compute_capability is not None and compute_capability >= 100:
+            # LINQ: the c3x INT8 scaled_mm is not built for SM100/SM120
+            # ("Int8 not supported on SM120"); the Triton kernel takes over.
+            return False, "CUTLASS INT8 scaled_mm requires SM < 100."
         return True, None
 
     @classmethod
