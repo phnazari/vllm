@@ -887,7 +887,7 @@ def dispatch_fused_moe_kernel(
         assert B_bias is None
 
         if use_int4_w4a8:
-            from linquant.kernels.moe.w4a8_vllm import invoke_fused_moe_w4a8_triton_kernel
+            from lores.kernels.moe.w4a8_vllm import invoke_fused_moe_w4a8_triton_kernel
 
             invoke_fused_moe_w4a8_triton_kernel(
                 A,
@@ -1791,7 +1791,7 @@ def fused_experts_impl(
     apply_moe_activation(
         activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
     )
-    from linquant.backends.vllm.rotations import apply_expert_r4
+    from lores.backends.vllm.rotations import apply_expert_r4
 
     apply_expert_r4(intermediate_cache2)
 

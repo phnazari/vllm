@@ -77,7 +77,7 @@ def get_ssm_configs(
     """
     cache_dtype = _canonical_cache_dtype(cache_dtype)
     device_name = get_ssm_device_name()
-    from linquant.backends.vllm.decode_tuning import override_table
+    from lores.backends.vllm.decode_tuning import override_table
 
     linq_configs = override_table("mamba_fp")
     if linq_configs is not None:

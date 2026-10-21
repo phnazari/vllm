@@ -80,7 +80,7 @@ class MambaStateDtypeCalculator:
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
         # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
-        from linquant.backends.vllm.state import linq_cache_dtypes
+        from lores.backends.vllm.state import linq_cache_dtypes
 
         return linq_cache_dtypes(dtypes)
 
@@ -119,7 +119,7 @@ class MambaStateDtypeCalculator:
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
         # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
-        from linquant.backends.vllm.state import linq_cache_dtypes
+        from lores.backends.vllm.state import linq_cache_dtypes
 
         return linq_cache_dtypes(dtypes)
 
@@ -131,7 +131,7 @@ class MambaStateDtypeCalculator:
     ) -> tuple[torch.dtype, torch.dtype]:
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         # LINQ-STATE: codes (uint8) + scales (fp32) replace the fp temporal state.
-        from linquant.backends.vllm.state import linq_cache_dtypes
+        from lores.backends.vllm.state import linq_cache_dtypes
 
         return linq_cache_dtypes((state_dtype, torch.float32))
 
@@ -197,7 +197,7 @@ class MambaStateShapeCalculator:
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
 
         # LINQ-STATE: codes + scales per slot; the fp state is prefill scratch and never enters the page.
-        from linquant.backends.vllm.state import linq_cache_shapes
+        from lores.backends.vllm.state import linq_cache_shapes
 
         return linq_cache_shapes(
             conv_state_shape, divide(num_heads, tp_world_size), head_dim, state_size
@@ -250,7 +250,7 @@ class MambaStateShapeCalculator:
         )
 
         # LINQ-STATE: codes + scales per slot; the fp state is prefill scratch and never enters the page.
-        from linquant.backends.vllm.state import linq_cache_shapes
+        from lores.backends.vllm.state import linq_cache_shapes
 
         return linq_cache_shapes(
             conv_state_shape, divide(num_v_heads, tp_world_size), head_v_dim, head_k_dim
@@ -281,7 +281,7 @@ class MambaStateShapeCalculator:
         )
         recurrent_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
         # LINQ-STATE: codes + scales per slot in vLLM's value-major [H, V, K] layout; the fp state is prefill scratch.
-        from linquant.backends.vllm.state import linq_cache_shapes
+        from lores.backends.vllm.state import linq_cache_shapes
 
         return linq_cache_shapes(
             conv_state_shape, divide(num_heads, tp_world_size), head_dim, head_k_dim

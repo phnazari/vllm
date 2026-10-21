@@ -902,7 +902,7 @@ class FusedMoEExpertsModular(FusedMoEExperts):
             topk_ids=topk_ids,
             expert_map=expert_map,
         )
-        from linquant.backends.vllm.rotations import apply_expert_r4
+        from lores.backends.vllm.rotations import apply_expert_r4
 
         apply_expert_r4(output)
 

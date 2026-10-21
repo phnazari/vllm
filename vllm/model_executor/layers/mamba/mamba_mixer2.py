@@ -22,22 +22,22 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from linquant.backends.vllm.state import (  # LINQ-STATE
+from lores.backends.vllm.state import (  # LINQ-STATE
     linq_bits,
     linq_decode,
     linq_pack_slots,
     linq_scratch,
     linq_unpack_slots,
 )
-from linquant.backends.vllm.rotations import (  # LINQ-ROT / LINQ-WA-ROT
+from lores.backends.vllm.rotations import (  # LINQ-ROT / LINQ-WA-ROT
     linq_rot_any,
     make_ro,
     mamba2_spec,
 )
-from linquant.kernels.rotations.conv_vllm import (  # LINQ-ROT
+from lores.kernels.rotations.conv_vllm import (  # LINQ-ROT
     causal_conv1d_fn as causal_conv1d_fn_rot,
 )
-from linquant.kernels.rotations.conv_vllm import (  # LINQ-ROT
+from lores.kernels.rotations.conv_vllm import (  # LINQ-ROT
     causal_conv1d_update as causal_conv1d_update_rot,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (

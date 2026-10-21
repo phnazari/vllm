@@ -62,7 +62,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
         format = scheme_dict.get("format")
-        from linquant.backends.vllm.moe import LinqW4A8IntMoEMethod, is_linq_w4a8_int
+        from lores.backends.vllm.moe import LinqW4A8IntMoEMethod, is_linq_w4a8_int
 
         if quant_config._is_mxfp4(weight_quant):
             from .compressed_tensors_moe_w4a4_mxfp4 import (

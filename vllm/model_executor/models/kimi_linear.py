@@ -29,7 +29,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
 )
-from linquant.backends.vllm.state import linq_set_config
+from lores.backends.vllm.state import linq_set_config
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -94,7 +94,7 @@ class KimiMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
-        from linquant.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
+        from lores.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
 
         self.linq_r4 = make_r4(intermediate_size, prefix)
 
@@ -156,8 +156,8 @@ class KimiMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        from linquant.backends.vllm.rotations import linq_set_expert_r4
-        from linquant.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
+        from lores.backends.vllm.rotations import linq_set_expert_r4
+        from lores.backends.vllm.rotations import make_r4  # LINQ-WA-ROT
 
         _r4 = make_r4(moe_intermediate_size, f"{prefix}.experts")  # routed experts: hook inside the MoE kernel
         if _r4 is not None:
